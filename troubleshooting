@@ -1,0 +1,262 @@
+
+There are two separate issues  here.
+
+1) The container is running, but the load balancer marks it unhealthy
+
+The workload itself appears healthy from the orchestration platform’s point of view:
+
+Running
+
+Ready=True
+
+Restarts=0
+
+
+But the external load balancer target shows:
+
+target <private-ip>:<port>
+
+Unhealthy
+
+Health status detail: Request timed out
+
+
+That usually means something is listening on the port, but the application is not returning the HTTP health-check response the load balancer expects, or the load balancer cannot reach the target correctly.
+
+The key clue is the mismatch:
+
+Platform probes use a TCP socket check
+
+Load balancer health check uses HTTP
+
+
+So the platform is only checking:
+
+> “Is something listening on this port?”
+
+
+
+while the load balancer is checking:
+
+> “Does this endpoint return a valid HTTP response?”
+
+
+
+Those are not the same thing.
+
+
+---
+
+2) The batch process is failing because of duplicate inserts
+
+The logs show a database uniqueness error:
+
+DuplicateKeyException
+
+Duplicate entry ... for key ... PRIMARY
+
+
+That means the application is trying to insert data for the same business key more than once.
+
+In other words, the collector/job is not idempotent.
+
+What idempotent means
+
+If the same collection runs more than once for the same input, it should produce the same final database state:
+
+not an error
+
+not duplicate rows
+
+not corrupted data
+
+
+Non-idempotent behavior looks like this:
+
+first run → insert succeeds
+
+second run for the same key → insert fails with duplicate key
+
+
+Idempotent behavior looks like this:
+
+first run → row is created
+
+second run for the same key → row is skipped or updated
+
+final table state remains correct
+
+
+This matters because retries happen naturally during:
+
+restarts
+
+redeployments
+
+overlapping schedules
+
+manual reruns
+
+partial failures followed by retry
+
+
+
+---
+
+Diagnosis
+
+A. The load balancer health issue is probably not caused by a crash
+
+Because the workload is still marked healthy internally, the more likely causes are:
+
+the application does not respond quickly on the health-check path
+
+the load balancer health-check path is wrong
+
+network/security rules block the load balancer from reaching the target
+
+the application accepts the TCP connection but hangs before returning HTTP
+
+
+B. The duplicate-key issue is likely caused by scheduler/job design
+
+Running scheduled collection logic inside a long-running replicated service is risky.
+
+Duplicate processing can happen because of:
+
+the scheduler running more than once for the same time window
+
+overlap during rollout/restart
+
+multiple replicas
+
+duplicate input records
+
+retries after partial success
+
+
+If the same batch runs twice, both executions may try to insert the same primary key.
+
+
+---
+
+What to fix first
+
+1) Test the application locally inside the container
+
+Run HTTP checks from inside the running container/process environment:
+
+curl -sv --max-time 5 http://127.0.0.1:<port>/
+curl -sv --max-time 5 http://127.0.0.1:<port>/health
+
+Interpretation:
+
+if / hangs, the application endpoint is the problem
+
+if /health works but / hangs, the load balancer health-check path should use /health
+
+if both work locally but the load balancer still times out, the issue is likely network/security related
+
+
+2) Use HTTP probes for an HTTP service
+
+If the application is HTTP-based, readiness and liveness checks should also use HTTP, not only TCP.
+
+Example:
+
+readinessProbe:
+  httpGet:
+    path: /health/readiness
+    port: <port>
+
+livenessProbe:
+  httpGet:
+    path: /health/liveness
+    port: <port>
+
+The load balancer health check should ideally use the same lightweight endpoint.
+
+3) Make database writes idempotent
+
+Use a retry-safe write strategy such as:
+
+INSERT ... ON DUPLICATE KEY UPDATE
+
+INSERT IGNORE
+
+delete-and-reload for a known key range
+
+another true upsert pattern supported by the database
+
+
+The strongest fix is usually an upsert, because it remains safe under retries and concurrency.
+
+4) Prevent multiple schedulers from running the same work
+
+Better patterns include:
+
+using a dedicated scheduled job resource instead of embedding a scheduler in a replicated service
+
+distributed locking
+
+leader election
+
+database-based locking
+
+
+For batch collection, a dedicated scheduled job is usually cleaner than keeping scheduler logic inside an autoscaled service.
+
+5) If local HTTP works, verify load balancer-to-target networking
+
+Check:
+
+load balancer security rules
+
+target security rules
+
+network ACLs
+
+health-check path and timeout settings
+
+whether the load balancer is targeting instance IPs or workload IPs directly
+
+
+A timeout with a running process often points to either:
+
+wrong health-check path
+
+network path blocked
+
+application accepts connection but does not return a valid HTTP response in time
+
+
+
+---
+
+Root cause summary
+
+Application-side issue:
+The batch collector reprocesses the same business key and attempts a plain insert, which fails on the primary key constraint.
+
+Infrastructure-side issue:
+Internal readiness is based on a TCP port check, but the external load balancer requires a real HTTP response and is timing out.
+
+
+---
+
+Recommended end state
+
+batch collection runs as a proper scheduled job, or uses distributed locking
+
+database writes are idempotent
+
+readiness/liveness checks use HTTP
+
+load balancer health checks use a lightweight health endpoint
+
+load balancer-to-target network rules are verified
+
+routing rules are reviewed if more than one application path must be served
+
+
+
