@@ -1,42 +1,205 @@
+A. Against “Our reply” under Sufficiency of Disclosure u/s 10(4)
 
-1. Sufficiency of Disclosure u/s 10(4)
-The reply may be strengthened by emphasizing that the specification discloses the complete technical pipeline, not merely the result of “personalized shadow generation.”
+The current reply is broadly fine, but I suggest adding more direct references from the specification and figures. The reply should show that the specification already discloses the input-process-output pipeline and is not merely result-oriented.
 
-Suggested technical point to add:
+Suggested addition/modification under this “Our reply”:
 
-The disclosed flow is:
+Please consider adding that the specification provides implementation details at multiple places:
 
-social/media data + virtual-environment parameters → contextual vectors/contextual image → base shadow + shadow attributes → masking/orientation/dimension adaptation → personalized/transfigured shadow rendered with the avatar.
+1. Paragraph [0030] describes the core invention: the personalized/contextual shadow is generated based on the user’s social-media profile and/or virtual-environment-related parameters, and is rendered in view of the shadow attributes of the actual base shadow.
 
-The specification and figures disclose the relevant inputs, modules, intermediate outputs, and final rendered output, including social-media crawling, contextual-vector generation, contextual-image generation, shadow-attribute extraction, image masking, orientation/dimension adaptation, and shadow transfiguration.
+2. Paragraph [0031] explains the technical/user effect of the personalized/contextual shadow: enhancing user interest in the virtual environment, providing an additional communication modality, and enabling advertisement/promotion.
 
-Also, instead of only saying that GAN/CNN/NLP techniques are known, the reply may clarify that the invention is not in claiming a new GAN/CNN/NLP model itself, but in the specific integration of such components into the disclosed personalized-shadow generation pipeline.
+3. Paragraphs [0032]–[0034] and Figure 1 explain the avatar 104, base shadow 106, profile picture/context 108, and personalized shadow 110. Figure 1 visually shows the base shadow being transfigured into the personalized shadow. This can help address the objection that “personalized shadow” is ambiguous.
 
-2. Definitiveness
-For the multiple-dependency objection, please verify and clarify that the pending claims do not appear to contain multiple dependencies. My understanding is that claims 2–7 depend from claim 1, and claims 9–14 depend from claim 8 or claim 11, where claim 11 itself depends from claim 8.
+4. Paragraphs [0035]–[0040] and Figure 2 disclose system 200 including processor/controller 202, I/O interface 204, modules 206, transceiver 208, memory 210, database 212, and operating system 214. This supports that the invention is implemented through a technical system and is not just an abstract idea.
 
-For the objection on “at least” and “one or more,” I understand these are common drafting terms. However, if the Controller insists, we may consider replacing them only where it does not materially affect scope. For example, for shadow attributes, “orientation and dimension of the base shadow” may be used as a more definite fallback, if you consider it appropriate.
+5. Paragraph [0041] directly supports extraction of user/media content. It discloses media content such as images, videos, text, emoticons, and user logs, including profile photos/videos, liked/commented media, user-uploaded comments/status/text, emoticons used in likes/comments/chats, and user-accessed page/account information.
 
-3. Non-Patentability u/s 3(k)
-The reply may be strengthened by explaining the invention as a technical image-processing / virtual-rendering pipeline, not a standalone software algorithm.
+6. Paragraph [0042] supports extraction of virtual-environment parameters, including avatar location, avatar action, avatar emotion, avatar field of view, user interaction profile, and engagement time.
 
-Suggested technical point to add:
+7. Paragraph [0043] supports contextual image/vector generation. It discloses generating a contextual image, generating contextual vectors based on media content/environment parameters, assigning priority based on user interest, determining interest level from user interaction, likes/dislikes, probabilistic calculations in vector space, similarity search, vector grouping, identifying the highest-priority contextual vector, and generating the contextual image based on that vector.
 
-The claimed output is a rendered personalized avatar shadow in a virtual environment. The invention involves extraction of media/environment inputs, contextual image generation, base-shadow attribute determination, transformation of the contextual image using shadow attributes, and rendering/mapping of the personalized shadow with the avatar. Therefore, it should not be treated merely as “program per se” or an abstract algorithm.
+8. Paragraph [0044] supports determining a base shadow and shadow attributes, including orientation and dimension.
 
-4. Inventive Step over D3
-D3 may disclose a CGR/virtual environment platform generally, but it does not disclose the specific personalized-shadow generation pipeline of the present invention, particularly generating contextual image/user context from media and environment parameters and transforming it based on base-shadow attributes.
+9. Paragraph [0045] supports transforming the contextual image based on shadow attributes to generate the personalized shadow, mapping/rendering the personalized shadow with the avatar, and modifying the personalized shadow based on user activity or environmental condition.
 
-5. Inventive Step over D5
-D5 appears to use virtual shadows for situation awareness in human-robot teaming. Its shadows are functional cues for presence, movement, position, or awareness. It does not disclose using social-media/user-interest data to generate a contextual image, nor transforming that contextual image using base-shadow orientation/dimension to create a personalized avatar shadow.
+10. Paragraphs [0051]–[0057] and Figure 3 provide a detailed process flow. They disclose extraction of media content/environment parameters at block 302a, use of a social-media crawler, like/dislike categorization, image captioning at block 302b, CNN/RNN-based captioning, word embedding at block 302c, Word2Vec/GloVe, similarity search at block 304a, mapping vectors to contexts such as party/gaming/shopping/travel/music/solitude/brand, priority assignment at block 304b, and avatar positioning / dynamic base-shadow generation at block 306a.
 
-6. Inventive Step over D6
-D6 appears to relate to hybrid volumetric-textural rendering for improving human avatar/body realism. It is about rendering the avatar/body, not using the avatar’s shadow as a personalization medium. It does not disclose deriving a contextual image from social-media or virtual-environment data and adapting it using base-shadow attributes.
+11. Figure 3 shows the complete technical flow: social feed crawler, image/text input, likes/dislikes, comments, image caption generator, embeddings, similarity search, prioritized context vector/text, GAN model for context/text-to-image generation, contextual images, conditional masking, rendering orientation/dimensions, shadow generation, avatar positioning, shadow-attribute extraction, spatial vector generation, TSGAN generator/discriminator, conditional vector, and transfigured shadow.
 
-7. Combined D3 + D5 + D6
-Even if combined, D3 may provide a CGR environment, D5 may provide functional shadow rendering, and D6 may provide avatar rendering. The combination still does not provide the missing pipeline:
+12. Figure 4 shows the implementation modules: social media crawler module 404, virtual-environment-related parameters 406, contextual vector generation module 408, shadow generator and attribute extractor module 410, contextual image generation and processing module 412, shadow transfiguration module 414, and database/memory 416 storing user image metadata, image captions, user text data, context vectors, shadow attributes, contextual image, processed image, and transfigured images.
 
-user/media context + virtual-environment context → contextual image → base-shadow attributes → transformation of contextual image → personalized avatar shadow.
+13. Figure 5 supports contextual-image processing: contextual image 502, conditional mask 504, orientation 506, dimension 508, and avatar/shadow rendering 510.
 
-8. Possible fallback amendment
-If the Controller remains concerned, please consider whether any fallback amendment can be based on the disclosed technical features, such as contextual-vector generation/prioritization, social-media crawling, image captioning/embedding, shadow-attribute extraction, conditional masking, orientation/dimension adaptation, and transfigured-shadow generation. 
+14. Figure 6 supports transfigured-shadow generation: contextual image, masking, shadow/color, shadow attributes, orientation/dimension adaptation, render image, generator/discriminator, noise vector, TSGAN, and generated transfigured image.
+
+15. Figure 12 maps directly to the claimed method steps 1202, 1204, 1206, and 1208.
+
+My technical point to be added:
+The disclosure is not just saying “generate a personalized shadow.” It describes the full pipeline:
+
+media/social data + virtual-environment parameters → contextual vectors/contextual image → base shadow + shadow attributes → masking/orientation/dimension adaptation → personalized/transfigured shadow rendered with avatar.
+
+Also, instead of only saying GAN/CNN/NLP are known, please clarify that the invention is not claiming a new CNN/GAN/NLP model itself. The invention is the specific integration of these known components into the above personalized-shadow generation pipeline.
+
+---
+
+B. Against “Our reply” under Definitiveness
+
+The current reply says multiple dependencies are not present. I agree, but suggest making this more concrete.
+
+Suggested addition/modification under this “Our reply”:
+
+Please consider adding:
+
+“From the pending claim set, claims 2–7 depend from independent claim 1. Claims 9–14 depend from independent claim 8 or from claim 11, and claim 11 depends from claim 8. Therefore, no multiple dependency appears to be present in the pending claims.”
+
+Regarding the objection on “at least” and “one or more,” I understand these terms are common. However, if the Controller insists, we can consider replacing them only where it does not materially hurt the scope.
+
+For example, for shadow attributes, the wording may be made more definite as “orientation and dimension of the base shadow”, since this appears supported by paragraphs [0044]–[0045], Figure 3, Figure 5, and Figure 6.
+
+Please decide whether this should be kept as an argument or used as a fallback amendment.
+
+---
+
+C. Against “Our reply” under Non-Patentability u/s 3(k)
+
+The current reply is directionally fine, but I suggest making it more engineering/technical and less dependent only on case law.
+
+Suggested addition/modification under this “Our reply”:
+
+Please consider adding that the invention is not only a software algorithm or “program per se.” It produces a technical visual-rendering output in a virtual environment.
+
+The claimed technical pipeline includes:
+
+1. extraction of user/media inputs and virtual-environment inputs;
+2. contextual vector/contextual image generation;
+3. base-shadow and shadow-attribute determination;
+4. masking/orientation/dimension transformation; and
+5. rendering/mapping of the personalized shadow with the avatar.
+
+Specification support may be taken from:
+
+- Paragraphs [0030]–[0031] for the core concept and technical effect;
+- Paragraphs [0041]–[0045] for input extraction, context generation, base shadow, shadow attributes, and transformation;
+- Paragraphs [0051]–[0057] for detailed method flow;
+- Figures 3–6 for implementation modules and rendering/transfiguration flow;
+- Figure 12 for the claimed method flow.
+
+My technical point to be added:
+This is an image-processing and virtual-environment rendering pipeline, not a standalone software algorithm. The claimed output is a rendered personalized avatar shadow generated by adapting a contextual image according to shadow attributes such as orientation and dimension.
+
+---
+
+D. Against “Our reply” on Inventive Step over D3
+
+The draft argument on D3 is fine, but I suggest adding more specific missing features.
+
+Suggested addition/modification under this “Our reply”:
+
+D3 may relate to a CGR platform / virtual or augmented reality rendering environment, but it does not disclose the specific personalized-shadow pipeline of the present invention.
+
+Please consider mentioning that D3 does not disclose:
+
+1. extracting social-media/media content for shadow personalization;
+2. extracting user interest from media content;
+3. generating contextual vectors from user media and environment parameters;
+4. generating a contextual image representing user interest/context;
+5. extracting base-shadow attributes;
+6. transforming the contextual image based on base-shadow orientation/dimension; and
+7. rendering the transformed contextual image as a personalized avatar shadow.
+
+---
+
+E. Against “Our reply” on Inventive Step over D5
+
+The current distinction is good. I suggest making the technical contrast sharper.
+
+Suggested addition/modification under this “Our reply”:
+
+D5 appears to use virtual shadows for situation awareness in human-robot teaming. The shadows in D5 are functional cues for presence, movement, position, awareness, or interaction in a human-robot environment.
+
+D5 does not disclose:
+
+1. using user social-media content;
+2. extracting user interest from media content;
+3. generating contextual vectors;
+4. generating a contextual image from social-media/environment context;
+5. transforming a contextual image based on base-shadow attributes;
+6. using avatar shadow as a personalized/context-aware representation.
+
+My technical distinction:
+D5 uses shadow as a situation-awareness cue. The present invention uses shadow as a personalized/contextual avatar representation generated from user/media context and virtual-environment context.
+
+---
+
+F. Against “Our reply” on Inventive Step over D6
+
+The current distinction is also good, but I suggest making it clearer that D6 is about avatar/body rendering, not shadow personalization.
+
+Suggested addition/modification under this “Our reply”:
+
+D6 relates to hybrid volumetric-textural rendering for human avatars and appears to improve avatar/body visual realism.
+
+D6 does not disclose:
+
+1. generating a personalized shadow;
+2. using the avatar shadow as the personalization medium;
+3. deriving contextual image from social-media content or virtual-environment parameters;
+4. adapting a contextual image using base-shadow orientation/dimension; and
+5. rendering the adapted contextual image as the avatar’s personalized shadow.
+
+My technical distinction:
+D6 is about rendering the avatar/body. The present invention is about generating a personalized/contextual shadow associated with the avatar.
+
+---
+
+G. Against any combined D3 + D5 + D6 obviousness argument
+
+If the Controller combines D3, D5, and D6, I suggest adding the following technical point.
+
+Suggested addition/modification:
+
+Even if D3, D5, and D6 are combined:
+
+- D3 may provide a CGR/virtual environment;
+- D5 may provide functional shadow rendering for situation awareness;
+- D6 may provide avatar/body rendering.
+
+But the combination still does not provide the missing pipeline:
+
+user/media context + virtual-environment context → contextual vectors/contextual image → base-shadow attributes → transformation of contextual image → personalized avatar shadow.
+
+There is also no clear technical motivation in D3/D5/D6 to use the avatar’s shadow as a personalized/context-aware representation derived from user media/social-media content.
+
+---
+
+H. Against any fallback amendment discussion
+
+If fallback amendment is needed, please consider using features that are already supported in the specification.
+
+Suggested technical features for possible fallback amendment:
+
+1. social media crawler extracting media content — paragraph [0052], Figure 3, Figure 4;
+2. media content including images, videos, text, emoticons, and user logs — paragraph [0041];
+3. environment parameters including avatar location, action, emotion, field of view, interaction profile, and engagement time — paragraph [0042];
+4. CNN/RNN-based image captioning — paragraph [0053], Figure 3;
+5. Word2Vec/GloVe embedding — paragraph [0054], Figure 3;
+6. similarity search and contextual-vector generation — paragraphs [0043], [0055], Figure 3;
+7. contextual-vector priority based on user interest — paragraphs [0043], [0056];
+8. avatar positioning and dynamic/base shadow generation — paragraph [0057], Figure 3;
+9. base-shadow attributes comprising orientation and dimension — paragraphs [0044]–[0045], Figures 3–6;
+10. conditional masking of the contextual image — Figure 5, Figure 6;
+11. orientation and dimensional adaptation of the contextual image based on base-shadow attributes — Figure 5, Figure 6;
+12. transfigured/personalized shadow generation — Figure 6.
+
+Please decide whether these should be used as arguments only or as fallback amendments, depending on the Controller’s position.
+
+---
+
+I. Overall technical point to keep in mind
+
+The invention should not be presented only as “generating a personalized shadow.” I think the stronger technical explanation is:
+
+The invention provides a virtual-rendering pipeline where user/media inputs and virtual-environment inputs are converted into contextual vectors/contextual image, and that contextual image is transformed using the avatar’s base-shadow attributes such as orientation and dimension to generate a personalized/transfigured shadow rendered with the avatar.
