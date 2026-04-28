@@ -1,0 +1,13 @@
+For the examiner’s comment that “determination of base shadow and shadow attributes is explained only functionally, without specifying rendering techniques,” please consider adding the following technical clarification.
+
+The specification does not merely state the result. It discloses example techniques and processing steps for base-shadow generation, shadow-attribute extraction, and rendering/transformation.
+
+Specifically, the specification describes that the system first identifies the avatar’s position in the virtual environment and generates a dynamic shadow of the avatar based on that position. It also expressly mentions that a shadow GAN may be used for generating the dynamic/base shadow. The dynamic/base shadow is mapped with the avatar and changes with the avatar and/or virtual-environment conditions.
+
+The specification further explains that shadow attributes are extracted from the base shadow, including orientation and dimension, and that spatial vectors may be generated from these shadow attributes. These spatial vectors are then used as conditional vectors for the later GAN-based generation/transfiguration stage.
+
+For rendering/transformation, the specification explains that the contextual image is transformed by conditional masking and reference adaptation of the base shadow. For example, the contextual image may be converted from colour to greyscale to represent a shadow, and the masked contextual image is rendered based on the orientation and dimension of the base shadow. The rendered processed contextual image is then used as a real image for the discriminator.
+
+The figures also support this implementation. Figure 3 shows shadow generation using Shadow GAN, avatar positioning, extraction of shadow attributes with orientation and dimension, spatial-vector generation, TSGAN generator/discriminator, and transfigured-shadow output. Figure 4 shows the shadow generator and attribute extractor module, contextual image generation/processing module, and shadow transfiguration module. Figures 5 and 6 further illustrate conditional masking, orientation/dimension adaptation, and transfigured-shadow generation.
+
+Therefore, from a technical perspective, the base shadow and shadow attributes are not described only functionally. The specification provides example rendering/processing techniques: avatar-position-based dynamic shadow generation, Shadow GAN, extraction of orientation/dimension attributes, spatial-vector generation, conditional masking, greyscale/shadow conversion, orientation/dimension-based rendering, and GAN/TSGAN-based shadow transfiguration.
