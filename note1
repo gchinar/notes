@@ -1,0 +1,42 @@
+
+1. Sufficiency of Disclosure u/s 10(4)
+The reply may be strengthened by emphasizing that the specification discloses the complete technical pipeline, not merely the result of “personalized shadow generation.”
+
+Suggested technical point to add:
+
+The disclosed flow is:
+
+social/media data + virtual-environment parameters → contextual vectors/contextual image → base shadow + shadow attributes → masking/orientation/dimension adaptation → personalized/transfigured shadow rendered with the avatar.
+
+The specification and figures disclose the relevant inputs, modules, intermediate outputs, and final rendered output, including social-media crawling, contextual-vector generation, contextual-image generation, shadow-attribute extraction, image masking, orientation/dimension adaptation, and shadow transfiguration.
+
+Also, instead of only saying that GAN/CNN/NLP techniques are known, the reply may clarify that the invention is not in claiming a new GAN/CNN/NLP model itself, but in the specific integration of such components into the disclosed personalized-shadow generation pipeline.
+
+2. Definitiveness
+For the multiple-dependency objection, please verify and clarify that the pending claims do not appear to contain multiple dependencies. My understanding is that claims 2–7 depend from claim 1, and claims 9–14 depend from claim 8 or claim 11, where claim 11 itself depends from claim 8.
+
+For the objection on “at least” and “one or more,” I understand these are common drafting terms. However, if the Controller insists, we may consider replacing them only where it does not materially affect scope. For example, for shadow attributes, “orientation and dimension of the base shadow” may be used as a more definite fallback, if you consider it appropriate.
+
+3. Non-Patentability u/s 3(k)
+The reply may be strengthened by explaining the invention as a technical image-processing / virtual-rendering pipeline, not a standalone software algorithm.
+
+Suggested technical point to add:
+
+The claimed output is a rendered personalized avatar shadow in a virtual environment. The invention involves extraction of media/environment inputs, contextual image generation, base-shadow attribute determination, transformation of the contextual image using shadow attributes, and rendering/mapping of the personalized shadow with the avatar. Therefore, it should not be treated merely as “program per se” or an abstract algorithm.
+
+4. Inventive Step over D3
+D3 may disclose a CGR/virtual environment platform generally, but it does not disclose the specific personalized-shadow generation pipeline of the present invention, particularly generating contextual image/user context from media and environment parameters and transforming it based on base-shadow attributes.
+
+5. Inventive Step over D5
+D5 appears to use virtual shadows for situation awareness in human-robot teaming. Its shadows are functional cues for presence, movement, position, or awareness. It does not disclose using social-media/user-interest data to generate a contextual image, nor transforming that contextual image using base-shadow orientation/dimension to create a personalized avatar shadow.
+
+6. Inventive Step over D6
+D6 appears to relate to hybrid volumetric-textural rendering for improving human avatar/body realism. It is about rendering the avatar/body, not using the avatar’s shadow as a personalization medium. It does not disclose deriving a contextual image from social-media or virtual-environment data and adapting it using base-shadow attributes.
+
+7. Combined D3 + D5 + D6
+Even if combined, D3 may provide a CGR environment, D5 may provide functional shadow rendering, and D6 may provide avatar rendering. The combination still does not provide the missing pipeline:
+
+user/media context + virtual-environment context → contextual image → base-shadow attributes → transformation of contextual image → personalized avatar shadow.
+
+8. Possible fallback amendment
+If the Controller remains concerned, please consider whether any fallback amendment can be based on the disclosed technical features, such as contextual-vector generation/prioritization, social-media crawling, image captioning/embedding, shadow-attribute extraction, conditional masking, orientation/dimension adaptation, and transfigured-shadow generation. 
