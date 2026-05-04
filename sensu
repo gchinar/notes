@@ -1,0 +1,244 @@
+Yes — this is a good fit for Graviton, but treat it as a two-part migration:
+
+1. Image compatibility: Sensu backend/agent image and all Sensu runtime assets/plugins must support linux/arm64.
+
+
+2. Scheduling: EKS must have ARM64/Graviton nodes, and your Sensu pods must be explicitly scheduled there through Git/Kustomize/ArgoCD.
+
+
+
+Sensu’s current docs list Docker images for backend + agent, including sensu/sensu based on Alpine and sensu/sensu-rhel; Sensu also documents Linux arm64 support for backend/agent/sensuctl binaries. The release notes specifically mention that the Alpine-based Docker image has multi-architecture support including linux/arm64. So first verify whether you are using a legacy/old image tag or an image that lacks the ARM manifest. 
+
+Recommended migration path for your STG branch
+
+1. Verify the current Sensu image architecture
+
+Run this for the exact image/tag currently in your STG manifests:
+
+docker buildx imagetools inspect <your-sensu-image>:<tag>
+
+or:
+
+crane manifest <your-sensu-image>:<tag> | jq '.manifests[].platform'
+
+You need to see:
+
+{
+  "architecture": "arm64",
+  "os": "linux"
+}
+
+If your current image is truly amd64 only, you have two options:
+
+Option	Recommendation
+
+Use upstream multi-arch Sensu image	Best if sensu/sensu:<version> supports your required version/features
+Build your own multi-arch image	Best if you customize the image, pin tools, add plugins, or use private base images
+
+
+For GitOps, do not patch this manually with kubectl. Change the image in the STG branch and let ArgoCD sync it.
+
+
+---
+
+2. Add Graviton node capacity in EKS
+
+Add a separate ARM64 node group or Karpenter NodePool. Keep your existing AMD64 nodes during migration.
+
+For Karpenter, the key requirement is:
+
+requirements:
+  - key: kubernetes.io/arch
+    operator: In
+    values: ["arm64"]
+
+AWS also recommends taints/tolerations during gradual Graviton migration so only explicitly opted-in workloads land on ARM nodes. 
+
+Example ARM node taint:
+
+taints:
+  - key: graviton
+    value: "true"
+    effect: NoSchedule
+
+
+---
+
+3. Add Kustomize patch for Sensu backend/agent scheduling
+
+Since you use Kustomize, add a patch in the STG overlay.
+
+For a Sensu backend StatefulSet or Deployment:
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sensu-backend
+spec:
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      tolerations:
+        - key: graviton
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+
+For Sensu agents, if they run as a DaemonSet, add the same patch:
+
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: sensu-agent
+spec:
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      tolerations:
+        - key: graviton
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+
+AWS/EKS examples use nodeSelector: kubernetes.io/arch: arm64 to restrict pods to Graviton nodes. 
+
+In kustomization.yaml:
+
+patches:
+  - path: patches/sensu-backend-arm64.yaml
+  - path: patches/sensu-agent-arm64.yaml
+
+
+---
+
+4. Check Sensu runtime assets/plugins
+
+This is the common hidden blocker.
+
+Sensu runtime assets are executed either by the backend or agent. Checks run on agents; handlers, filters, and mutators run on backends. Sensu chooses asset builds using filters such as entity.system.os and entity.system.arch. 
+
+Look for assets like this:
+
+filters:
+  - entity.system.os == 'linux'
+  - entity.system.arch == 'amd64'
+
+For Graviton, you need ARM64 asset builds too:
+
+filters:
+  - entity.system.os == 'linux'
+  - entity.system.arch == 'arm64'
+
+So before moving Sensu agents/backend to ARM, audit all Sensu Asset resources in Git:
+
+grep -R "entity.system.arch" ./sensu
+grep -R "amd64" ./sensu
+
+For each asset:
+
+If Bonsai/upstream provides linux_arm64, add that build.
+
+If it is your own plugin, rebuild it for linux/arm64.
+
+If it is shell/Python/Ruby based, make sure its interpreter/runtime asset also supports ARM64.
+
+
+
+---
+
+5. Rollout sequence in STG
+
+Use this order:
+
+1. Add ARM64/Graviton node group or Karpenter NodePool.
+2. Keep ARM nodes tainted.
+3. Update Sensu image to multi-arch or ARM-capable image.
+4. Add ARM64 runtime asset builds.
+5. Add Kustomize nodeSelector + toleration patches.
+6. Let ArgoCD sync STG.
+7. Validate Sensu backend health.
+8. Validate agent registration.
+9. Validate checks, handlers, and events.
+10. Only then repeat for prod.
+
+Validation commands:
+
+kubectl get nodes -L kubernetes.io/arch
+kubectl get pods -n <sensu-namespace> -o wide
+kubectl describe pod -n <sensu-namespace> <sensu-pod>
+
+Confirm pods are on ARM nodes:
+
+kubectl get pod -n <sensu-namespace> -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName
+
+Then check node architecture:
+
+kubectl get node <node-name> -o jsonpath='{.metadata.labels.kubernetes\.io/arch}'
+
+Expected:
+
+arm64
+
+Sensu checks:
+
+sensuctl entity list
+sensuctl event list
+sensuctl check list
+sensuctl asset list
+
+
+---
+
+GitOps/Kustomize structure I’d use
+
+Since your Sensu manifests are already together and fully managed by ArgoCD, keep the base architecture-neutral and put Graviton changes in the STG overlay:
+
+sensu/
+  base/
+    backend.yaml
+    agent.yaml
+    service.yaml
+    secrets.yaml
+    checks/
+    handlers/
+    assets/
+    kustomization.yaml
+
+  overlays/
+    stg/
+      kustomization.yaml
+      patches/
+        sensu-backend-arm64.yaml
+        sensu-agent-arm64.yaml
+        sensu-image.yaml
+        sensu-assets-arm64.yaml
+
+Your STG overlay should contain:
+
+images:
+  - name: <current-sensu-image>
+    newName: sensu/sensu
+    newTag: <validated-version>
+
+And the ARM scheduling patches.
+
+
+---
+
+Main risks to check
+
+Risk	What to check
+
+Image is amd64-only	docker buildx imagetools inspect
+Plugins/assets are amd64-only	Search entity.system.arch == 'amd64'
+Backend uses persistent storage	Ensure PVC/EBS works across replacement pods
+Single backend replica	Expect brief downtime during restart unless HA
+DaemonSet agents	They will only run on ARM nodes if nodeSelector: arm64 is added
+Mixed node cluster	Use taints to prevent accidental scheduling of non-ARM-ready pods
+
+
+Bottom line
+
+For STG, I’d first switch Sensu to a verified multi-arch image, update all Sensu Asset definitions for arm64, then add Graviton nodes with a taint and opt Sensu in using Kustomize patches. Once STG is healthy, the same GitOps pattern can be promoted to prod.
