@@ -1,165 +1,116 @@
-Understood. Then the answer is:
+Yes, many Sensu assets are available publicly, mainly through Bonsai, the Sensu asset hub. You do not need to rebuild every asset by default.
 
-Yes, you can move to Graviton only, but you must convert/rebuild every Sensu runtime asset to ARM64 first. There is no safe Graviton-only path where AMD64-only assets continue working unchanged.
+But you do need to check each asset.
 
-Sensu itself can run on Linux arm64, but Sensu runtime assets are separate packages used by checks, handlers, mutators, and filters. Sensu selects asset builds using filters like entity.system.arch == 'amd64' or entity.system.arch == 'arm64', so AMD64-only assets will not match ARM64 agents/backends. 
+Sensu’s docs say Bonsai can be used to discover and download dynamic runtime assets, and Sensu assets can contain one or more builds with OS/architecture filters. The agent/backend evaluates those filters and downloads the first matching build. So for Graviton, you need a linux arm64 build for each asset used by checks, handlers, mutators, or filters. 
 
-What you should do
+Decision rule
 
-Keep:
+For each current asset:
 
-Existing check names
-Existing asset names
-Existing runtime_assets references
-Existing ArgoCD/GitOps flow
+Current asset source	Need to rebuild?
 
-Change:
+Public Bonsai/GitHub asset has linux arm64 release	No, just update your Git YAML to use/add the ARM64 build
+Public asset only has linux amd64	Yes, or find a newer/replacement asset
+Your internal/custom asset	Yes, unless it is script-only and architecture-neutral
+Ruby/Python/Node asset	Maybe — depends on runtime/dependencies
+Closed-source binary asset	Yes, unless vendor provides ARM64
 
-Asset artifacts: add ARM64 builds
-Sensu image: use ARM64/multi-arch image
-Kustomize scheduling: force pods to arm64 nodes
 
-Required migration sequence
+Example: public ARM64 asset exists
 
-1. First, inventory all assets
+For example, sensu/sensu-slack-handler version 1.6.2 has release assets for linux amd64 and linux arm64, with separate SHA512 values. So for that type of public asset, you would not rebuild; you would update the asset definition in Git to include/use the linux_arm64 build. 
 
-From your STG branch:
+Similarly, Sensu’s asset docs show sensu/check-cpu-usage as a multi-build asset with a linux_arm64 build and an entity.system.arch == 'arm64' filter. 
+
+What you should do in your STG branch
+
+Since you are fully GitOps-managed by ArgoCD, do not run sensuctl asset add directly against STG as the final change.
+
+Use it only to inspect/download/generate definitions, then commit the YAML.
+
+1. List your current assets
+
+sensuctl asset list --format yaml > current-assets.yaml
+
+Or from Git:
 
 grep -R "type: Asset" .
-grep -R "runtime_assets" .
+grep -R "io.sensu.bonsai" .
 grep -R "entity.system.arch" .
+grep -R "linux_amd64" .
 grep -R "amd64" .
 
-You need to classify each asset:
+2. Identify Bonsai-backed assets
 
-Asset type	What to do
+Look for annotations like:
 
-Go binary plugin	Rebuild with GOARCH=arm64
-Shell-only script	Usually repack same script as ARM64-compatible after testing
-Python/Ruby/Node asset	Rebuild/test on ARM64 because dependencies may include native libraries
-Vendor/Bonsai asset	Check whether newer version has linux_arm64 build
-Closed-source AMD64 binary	Cannot move to Graviton unless vendor provides ARM64 build
+annotations:
+  io.sensu.bonsai.namespace: sensu
+  io.sensu.bonsai.name: sensu-slack-handler
+  io.sensu.bonsai.version: 1.6.2
 
+That tells you the public Bonsai source.
 
-2. Rebuild assets for ARM64
+3. Check whether Bonsai has ARM64
 
-For Go-based Sensu plugins:
+For each asset, check the Bonsai page’s Release Assets tab.
 
-GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bin/check-example ./cmd/check-example
-tar -czf check-example_linux_arm64.tar.gz bin/check-example
-sha512sum check-example_linux_arm64.tar.gz
+You want to see:
 
-For shell-only assets, you may be able to reuse the same script package, but still test it on an ARM64 node before adding the arm64 filter.
+linux arm64
 
-3. Keep the same asset name, add ARM64 build
+If it exists, use that URL and SHA512.
 
-Do not rename assets.
+4. Keep the same asset name
 
-Your check can stay like this:
+Do this:
 
-runtime_assets:
-  - check-disk
-
-Update the existing asset:
-
-type: Asset
-api_version: core/v2
 metadata:
-  name: check-disk
-  namespace: default
+  name: sensu-slack-handler
 spec:
   builds:
-    - url: https://artifacts.example.com/check-disk_linux_amd64.tar.gz
-      sha512: <amd64-sha512>
+    - url: https://assets.bonsai.sensu.io/.../sensu-slack-handler_1.6.2_linux_amd64.tar.gz
+      sha512: <amd64-sha>
       filters:
         - entity.system.os == 'linux'
         - entity.system.arch == 'amd64'
 
-    - url: https://artifacts.example.com/check-disk_linux_arm64.tar.gz
-      sha512: <arm64-sha512>
+    - url: https://assets.bonsai.sensu.io/.../sensu-slack-handler_1.6.2_linux_arm64.tar.gz
+      sha512: <arm64-sha>
       filters:
         - entity.system.os == 'linux'
         - entity.system.arch == 'arm64'
 
-This lets you keep all existing checks unchanged.
+Your check remains unchanged:
 
-4. Move Sensu to ARM64 only after assets are ready
+runtime_assets:
+  - sensu-slack-handler
 
-Once every required asset has ARM64 support, update the Sensu backend and agent scheduling in your STG Kustomize overlay.
+Important
 
-Example patch:
+If you use Bonsai assets, pin the version. Sensu’s docs recommend specifying the asset version because installing “latest” can introduce breaking changes. 
 
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: sensu-backend
-spec:
-  template:
-    spec:
-      nodeSelector:
-        kubernetes.io/arch: arm64
+So prefer:
 
-For the agent DaemonSet:
+sensuctl asset add sensu/sensu-slack-handler:1.6.2 -r sensu-slack-handler
 
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: sensu-agent
-spec:
-  template:
-    spec:
-      nodeSelector:
-        kubernetes.io/arch: arm64
+not:
 
-EKS/Graviton scheduling commonly uses the Kubernetes label kubernetes.io/arch: arm64 to force pods onto Graviton nodes. 
+sensuctl asset add sensu/sensu-slack-handler
 
-If your Graviton nodes are tainted, also add:
+Again, use this for generating/inspecting YAML, then commit to Git.
 
-tolerations:
-  - key: graviton
-    operator: Equal
-    value: "true"
-    effect: NoSchedule
+Bottom line
 
-AWS also recommends taints when introducing Graviton nodes so incompatible AMD64 workloads do not accidentally schedule there. 
+You only need to rebuild assets when no public ARM64 build exists.
 
-5. Validate in STG
+Your migration task is:
 
-After ArgoCD sync:
+Current asset list
+→ find public Bonsai/GitHub source
+→ check for linux arm64 release
+→ if exists, update YAML
+→ if not, rebuild/fork/replace
 
-kubectl get nodes -L kubernetes.io/arch
-kubectl get pods -n <sensu-namespace> -o wide
-
-Confirm Sensu pods are on ARM64 nodes:
-
-kubectl get pod -n <sensu-namespace> -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName
-
-Then check Sensu:
-
-sensuctl entity list
-sensuctl asset list --format yaml
-sensuctl check list
-sensuctl event list
-
-Look specifically for asset download or execution errors in agent/backend logs:
-
-kubectl logs -n <sensu-namespace> daemonset/sensu-agent
-kubectl logs -n <sensu-namespace> deploy/sensu-backend
-
-Important: do not rely on AMD64 emulation
-
-Technically, people sometimes try QEMU/binfmt emulation for AMD64 binaries on ARM64 nodes, but I would not recommend it for Sensu checks in production. It adds performance overhead, debugging complexity, and weakens the cost-saving reason for moving to Graviton.
-
-Final recommendation
-
-For Graviton only, your minimum required checklist is:
-
-1. Use ARM64/multi-arch Sensu backend/agent image.
-2. Rebuild or replace every Sensu runtime asset for ARM64.
-3. Keep check definitions unchanged.
-4. Keep asset names unchanged.
-5. Add arm64 builds under the existing Asset resources.
-6. Force backend and agent pods to kubernetes.io/arch: arm64.
-7. Validate all checks, handlers, mutators, and events in STG.
-
-So yes, you can move fully to Graviton, but the blocking work is asset conversion, not Sensu check migration.
+So the practical answer is: start by checking Bonsai for each asset. Rebuild only the missing ones.
