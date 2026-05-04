@@ -1,167 +1,119 @@
-Yes, you can keep your existing checks and mostly keep your existing asset names/references.
+Understood. Then the answer is:
 
-The thing you cannot keep unchanged** is any asset artifact that is amd64-only and needs to execute on Graviton/ARM64.
+Yes, you can move to Graviton only, but you must convert/rebuild every Sensu runtime asset to ARM64 first. There is no safe Graviton-only path where AMD64-only assets continue working unchanged.
 
-Sensu supports dynamic runtime assets with multiple builds under the same asset definition, selected by filters such as entity.system.arch == 'amd64' or entity.system.arch == 'arm64'. Sensu’s docs explicitly show assets with separate linux_amd64 and linux_arm64 builds under the same asset, and note that filters determine which build is downloaded and installed. 
+Sensu itself can run on Linux arm64, but Sensu runtime assets are separate packages used by checks, handlers, mutators, and filters. Sensu selects asset builds using filters like entity.system.arch == 'amd64' or entity.system.arch == 'arm64', so AMD64-only assets will not match ARM64 agents/backends. 
 
-Best approach: keep check names and asset names the same
+What you should do
 
-Do not change your checks like this:
+Keep:
+
+Existing check names
+Existing asset names
+Existing runtime_assets references
+Existing ArgoCD/GitOps flow
+
+Change:
+
+Asset artifacts: add ARM64 builds
+Sensu image: use ARM64/multi-arch image
+Kustomize scheduling: force pods to arm64 nodes
+
+Required migration sequence
+
+1. First, inventory all assets
+
+From your STG branch:
+
+grep -R "type: Asset" .
+grep -R "runtime_assets" .
+grep -R "entity.system.arch" .
+grep -R "amd64" .
+
+You need to classify each asset:
+
+Asset type	What to do
+
+Go binary plugin	Rebuild with GOARCH=arm64
+Shell-only script	Usually repack same script as ARM64-compatible after testing
+Python/Ruby/Node asset	Rebuild/test on ARM64 because dependencies may include native libraries
+Vendor/Bonsai asset	Check whether newer version has linux_arm64 build
+Closed-source AMD64 binary	Cannot move to Graviton unless vendor provides ARM64 build
+
+
+2. Rebuild assets for ARM64
+
+For Go-based Sensu plugins:
+
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bin/check-example ./cmd/check-example
+tar -czf check-example_linux_arm64.tar.gz bin/check-example
+sha512sum check-example_linux_arm64.tar.gz
+
+For shell-only assets, you may be able to reuse the same script package, but still test it on an ARM64 node before adding the arm64 filter.
+
+3. Keep the same asset name, add ARM64 build
+
+Do not rename assets.
+
+Your check can stay like this:
 
 runtime_assets:
-  - check-cpu-usage-arm64
+  - check-disk
 
-Instead, keep this unchanged:
-
-runtime_assets:
-  - check-cpu-usage
-
-Then update the existing Asset named check-cpu-usage to include both builds:
+Update the existing asset:
 
 type: Asset
 api_version: core/v2
 metadata:
-  name: check-cpu-usage
+  name: check-disk
   namespace: default
 spec:
   builds:
-    - url: https://your-artifact-store/check-cpu-usage_linux_amd64.tar.gz
+    - url: https://artifacts.example.com/check-disk_linux_amd64.tar.gz
       sha512: <amd64-sha512>
       filters:
         - entity.system.os == 'linux'
         - entity.system.arch == 'amd64'
 
-    - url: https://your-artifact-store/check-cpu-usage_linux_arm64.tar.gz
+    - url: https://artifacts.example.com/check-disk_linux_arm64.tar.gz
       sha512: <arm64-sha512>
       filters:
         - entity.system.os == 'linux'
         - entity.system.arch == 'arm64'
 
-That way:
+This lets you keep all existing checks unchanged.
 
-Check definition: unchanged
-runtime_assets value: unchanged
-Asset metadata.name: unchanged
-Only Asset builds: updated
+4. Move Sensu to ARM64 only after assets are ready
 
-This is the safest GitOps migration pattern.
+Once every required asset has ARM64 support, update the Sensu backend and agent scheduling in your STG Kustomize overlay.
 
-Important point
+Example patch:
 
-If your asset currently looks like this:
-
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sensu-backend
 spec:
-  url: https://your-artifact-store/plugin_linux_amd64.tar.gz
-  sha512: <sha>
-  filters:
-    - entity.system.os == 'linux'
-    - entity.system.arch == 'amd64'
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: arm64
 
-convert it to multi-build format:
+For the agent DaemonSet:
 
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: sensu-agent
 spec:
-  builds:
-    - url: https://your-artifact-store/plugin_linux_amd64.tar.gz
-      sha512: <amd64-sha>
-      filters:
-        - entity.system.os == 'linux'
-        - entity.system.arch == 'amd64'
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: arm64
 
-    - url: https://your-artifact-store/plugin_linux_arm64.tar.gz
-      sha512: <arm64-sha>
-      filters:
-        - entity.system.os == 'linux'
-        - entity.system.arch == 'arm64'
+EKS/Graviton scheduling commonly uses the Kubernetes label kubernetes.io/arch: arm64 to force pods onto Graviton nodes. 
 
-Sensu docs say single-build assets using top-level url and sha512 are deprecated, and recommend spec.builds for one or more builds. 
-
-What this means for your migration
-
-You have two separate things to migrate:
-
-1. Sensu container image
-
-You need an ARM64-capable Sensu backend/agent image.
-
-If you want the lowest-risk migration, do not upgrade Sensu and architecture at the same time. Ideally, use the same Sensu version you run today, but with an ARM64 or multi-arch image.
-
-So instead of immediately jumping to:
-
-sensu/sensu:6.11.0
-
-I would first ask:
-
-What Sensu version are you running today?
-
-Then use that same version if an ARM64 image/build exists.
-
-Sensu’s platform docs list ARM64/aarch64 support for the Sensu backend and show Linux arm64 binary distributions that include the agent, backend, and sensuctl. 
-
-2. Existing Sensu assets
-
-Your checks can remain the same, but every referenced asset must support ARM64 if it will run on ARM nodes.
-
-Audit your Git repo:
-
-grep -R "runtime_assets" ./sensu
-grep -R "entity.system.arch" ./sensu
-grep -R "amd64" ./sensu
-grep -R "url:" ./sensu/assets
-
-For every asset used by checks, handlers, filters, or mutators, confirm one of these:
-
-It already has a linux_arm64 build
-It is a script-only asset and works on ARM64
-You can rebuild it for ARM64
-You will temporarily keep that workload on AMD64
-
-Phased migration I recommend
-
-Phase 1 — keep checks/assets logically unchanged
-
-Update only the asset definitions to add ARM64 builds under the same names.
-
-No check changes.
-
-Phase 2 — move Sensu backend to Graviton
-
-This mainly affects:
-
-handlers
-filters
-mutators
-backend-side assets
-
-If handlers use assets, those assets must support ARM64.
-
-Phase 3 — move Sensu agents to Graviton
-
-This affects:
-
-checks
-check runtime_assets
-local scripts/binaries
-
-This is where most asset failures show up.
-
-ArgoCD/Kustomize-safe pattern
-
-In your STG overlay:
-
-overlays/stg/
-  kustomization.yaml
-  patches/
-    sensu-image-arm64.yaml
-    sensu-backend-graviton-scheduling.yaml
-    sensu-agent-graviton-scheduling.yaml
-    sensu-assets-arm64.yaml
-
-Keep check YAMLs unchanged unless absolutely required.
-
-For scheduling:
-
-nodeSelector:
-  kubernetes.io/arch: arm64
+If your Graviton nodes are tainted, also add:
 
 tolerations:
   - key: graviton
@@ -169,19 +121,45 @@ tolerations:
     value: "true"
     effect: NoSchedule
 
-My recommendation
+AWS also recommends taints when introducing Graviton nodes so incompatible AMD64 workloads do not accidentally schedule there. 
 
-Do not change your check definitions.
+5. Validate in STG
 
-Do not rename your assets.
+After ArgoCD sync:
 
-Do this instead:
+kubectl get nodes -L kubernetes.io/arch
+kubectl get pods -n <sensu-namespace> -o wide
 
-Keep existing checks
-Keep existing asset names
-Convert each asset to multi-build format
-Add linux/arm64 asset build beside existing linux/amd64 build
-Use same Sensu version if possible, but with ARM64-capable image
-Move backend first, then agents
+Confirm Sensu pods are on ARM64 nodes:
 
-So the answer is: yes, you can keep your existing checks and assets from a GitOps/config point of view — but any amd64-only asset artifact must either get an ARM64 build or stay running on AMD64 nodes.
+kubectl get pod -n <sensu-namespace> -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName
+
+Then check Sensu:
+
+sensuctl entity list
+sensuctl asset list --format yaml
+sensuctl check list
+sensuctl event list
+
+Look specifically for asset download or execution errors in agent/backend logs:
+
+kubectl logs -n <sensu-namespace> daemonset/sensu-agent
+kubectl logs -n <sensu-namespace> deploy/sensu-backend
+
+Important: do not rely on AMD64 emulation
+
+Technically, people sometimes try QEMU/binfmt emulation for AMD64 binaries on ARM64 nodes, but I would not recommend it for Sensu checks in production. It adds performance overhead, debugging complexity, and weakens the cost-saving reason for moving to Graviton.
+
+Final recommendation
+
+For Graviton only, your minimum required checklist is:
+
+1. Use ARM64/multi-arch Sensu backend/agent image.
+2. Rebuild or replace every Sensu runtime asset for ARM64.
+3. Keep check definitions unchanged.
+4. Keep asset names unchanged.
+5. Add arm64 builds under the existing Asset resources.
+6. Force backend and agent pods to kubernetes.io/arch: arm64.
+7. Validate all checks, handlers, mutators, and events in STG.
+
+So yes, you can move fully to Graviton, but the blocking work is asset conversion, not Sensu check migration.
