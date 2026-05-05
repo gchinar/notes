@@ -1,285 +1,108 @@
-Use this one approach:
+Yes — sha512 should be in the Sensu Asset definition.
 
-Sync ARM64 assets → move backend to ARM64 → test one ARM64 canary agent → move all agents to ARM64
+A Sensu dynamic runtime asset build is made of:
 
-Assume:
+url: <asset-tar.gz-url>
+sha512: <checksum>
+filters:
+  - entity.system.os == 'linux'
+  - entity.system.arch == 'arm64'
 
-export NS=sensu
-export ARGO_APP=sensu-stg
-export BACKEND_NAME=sensu-backend
-export AGENT_DS=sensu-agent
-export SENSU_IMAGE="sensu/sensu:6.14.0"
+Sensu docs describe an asset build as the combination of an artifact URL, SHA512 checksum, and optional filters; Sensu downloads the artifact from the URL and only unpacks it if the downloaded file’s SHA512 matches the configured checksum. 
 
-Change names if yours are different.
+Where to get the asset tar file
 
+You have 3 options.
 
----
+Option 1 — From Bonsai asset definition
 
-1. Verify Graviton nodes exist
+For public Sensu assets, Bonsai usually provides the asset tarball URL and SHA512 in the asset definition.
 
-kubectl get nodes -L kubernetes.io/arch
-
-You should see at least one node with:
-
-arm64
-
-Check only ARM64 nodes:
-
-kubectl get nodes -l kubernetes.io/arch=arm64
-
-
----
-
-2. Verify Sensu image supports ARM64
-
-docker buildx imagetools inspect ${SENSU_IMAGE} | grep -E "linux/(amd64|arm64)"
-
-Expected:
-
-linux/amd64
-linux/arm64
-
-
----
-
-3. Sync your updated assets first
-
-Since you already added both amd64 and arm64 asset builds, commit that first.
-
-git status
-git add .
-git commit -m "Add arm64 builds for Sensu assets"
-git push
-
-Sync ArgoCD:
-
-argocd app diff ${ARGO_APP}
-argocd app sync ${ARGO_APP}
-argocd app wait ${ARGO_APP} --sync --health --timeout 600
-
-Verify Sensu sees both architectures:
-
-sensuctl asset list --format yaml | grep -E "name:|amd64|arm64"
-
-
----
-
-4. Move Sensu backend to ARM64
-
-Create a Kustomize patch:
-
-mkdir -p overlays/stg/patches
-cat > overlays/stg/patches/sensu-backend-arm64.yaml <<'EOF'
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: sensu-backend
-spec:
-  template:
-    spec:
-      nodeSelector:
-        kubernetes.io/arch: arm64
-      tolerations:
-        - key: graviton
-          operator: Equal
-          value: "true"
-          effect: NoSchedule
-EOF
-
-If your backend is a Deployment, change this line:
-
-kind: StatefulSet
-
-to:
-
-kind: Deployment
-
-Add patch to overlays/stg/kustomization.yaml:
-
-cat >> overlays/stg/kustomization.yaml <<'EOF'
-
-patches:
-  - path: patches/sensu-backend-arm64.yaml
-EOF
-
-If your kustomization.yaml already has patches:, add only this line under it:
-
-- path: patches/sensu-backend-arm64.yaml
-
-Commit and sync:
-
-git add overlays/stg
-git commit -m "Move Sensu backend to arm64 in STG"
-git push
-
-argocd app sync ${ARGO_APP}
-argocd app wait ${ARGO_APP} --sync --health --timeout 600
-
-Validate:
-
-kubectl get pods -n ${NS} -o wide | grep sensu-backend
-kubectl logs -n ${NS} sts/${BACKEND_NAME} --tail=100
-sensuctl entity list
-sensuctl event list
-
-If backend is a deployment:
-
-kubectl logs -n ${NS} deploy/${BACKEND_NAME} --tail=100
-
-
----
-
-5. Test one ARM64 canary agent
-
-Label one ARM64 node:
-
-ARM_NODE=$(kubectl get nodes -l kubernetes.io/arch=arm64 -o jsonpath='{.items[0].metadata.name}')
-kubectl label node ${ARM_NODE} sensu-arm64-canary=true --overwrite
-
-Create a canary patch by copying your existing agent DaemonSet YAML into a new manifest is safest. If you already have the agent manifest in Git, copy it:
-
-cp base/sensu-agent.yaml overlays/stg/sensu-agent-arm64-canary.yaml
-
-Edit the copied file:
-
-vi overlays/stg/sensu-agent-arm64-canary.yaml
-
-Change these fields:
-
-metadata:
-  name: sensu-agent-arm64-canary
+Example from Bonsai-style asset YAML:
 
 spec:
-  selector:
-    matchLabels:
-      app: sensu-agent-arm64-canary
+  builds:
+    - url: https://assets.bonsai.sensu.io/.../asset_linux_arm64.tar.gz
+      sha512: <sha512>
+      filters:
+        - entity.system.os == 'linux'
+        - entity.system.arch == 'arm64'
 
-  template:
-    metadata:
-      labels:
-        app: sensu-agent-arm64-canary
-    spec:
-      nodeSelector:
-        kubernetes.io/arch: arm64
-        sensu-arm64-canary: "true"
-      tolerations:
-        - key: graviton
-          operator: Equal
-          value: "true"
-          effect: NoSchedule
-
-Also make sure the canary agent has a separate subscription, for example:
-
-stg-arm64-canary
-
-Add the canary manifest to overlays/stg/kustomization.yaml:
-
-resources:
-  - sensu-agent-arm64-canary.yaml
-
-Commit and sync:
-
-git add overlays/stg
-git commit -m "Add Sensu arm64 canary agent in STG"
-git push
-
-argocd app sync ${ARGO_APP}
-argocd app wait ${ARGO_APP} --sync --health --timeout 600
-
-Validate canary pod is on ARM64:
-
-kubectl get pods -n ${NS} -o wide | grep sensu-agent-arm64-canary
-kubectl get node ${ARM_NODE} -o jsonpath='{.metadata.labels.kubernetes\.io/arch}'; echo
-
-Expected:
-
-arm64
-
-Check Sensu entity:
-
-sensuctl entity list | grep arm64
-sensuctl event list
-
-Check logs:
-
-kubectl logs -n ${NS} ds/sensu-agent-arm64-canary --tail=200
-
-Look for these errors:
-
-exec format error
-no matching asset build
-failed to fetch asset
-ruby not found
-permission denied
+Bonsai asset pages can include an “Asset definition” section with the url and sha512; for example, the sensu-plugins-http Bonsai page shows a tarball URL under assets.bonsai.sensu.io and its SHA512. 
 
 
 ---
 
-6. Move main Sensu agent DaemonSet to ARM64
+Option 2 — Use sensuctl asset add to generate the definition
 
-Only after the canary works, create the main agent patch:
+This is the easiest way.
 
-cat > overlays/stg/patches/sensu-agent-arm64.yaml <<'EOF'
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: sensu-agent
-spec:
-  template:
-    spec:
-      nodeSelector:
-        kubernetes.io/arch: arm64
-      tolerations:
-        - key: graviton
-          operator: Equal
-          value: "true"
-          effect: NoSchedule
-EOF
+Sensu docs say you can install an asset definition directly from Bonsai using:
 
-Add it to kustomization.yaml under patches:
+sensuctl asset add <ASSET_NAME>:<ASSET_VERSION>
 
-- path: patches/sensu-agent-arm64.yaml
+They also recommend pinning a version instead of using latest, because latest can introduce breaking changes. 
 
-Commit and sync:
+For your assets, run these in a scratch/dev Sensu backend, not directly in GitOps-managed STG if you want to avoid ArgoCD drift:
 
-git add overlays/stg
-git commit -m "Move Sensu agents to arm64 in STG"
-git push
+sensuctl asset add sensu/http-checks:<version> --rename http-check
+sensuctl asset add sensu/sensu-aggregate-check:<version> --rename aggregate-check
+sensuctl asset add sensu/sensu-aws-sns-handler:<version> --rename aws-sns-handler
+sensuctl asset add sensu/sensu-cloudwatch-check:<version> --rename cloudwatch-check
+sensuctl asset add sensu-plugins/sensu-plugins-aws:<version> --rename plugins-aws
+sensuctl asset add sensu-plugins/sensu-plugins-http:<version> --rename plugins-http
+sensuctl asset add sensu/sensu-ruby-runtime:<version> --rename ruby-runtime
 
-argocd app sync ${ARGO_APP}
-argocd app wait ${ARGO_APP} --sync --health --timeout 600
+Then export the generated asset YAML:
 
-Validate:
+sensuctl asset list --format yaml > generated-assets.yaml
 
-kubectl get pods -n ${NS} -o wide | grep sensu-agent
-kubectl get nodes -L kubernetes.io/arch
-sensuctl entity list
-sensuctl event list
-kubectl logs -n ${NS} ds/${AGENT_DS} --tail=200
+From that file, copy the url, sha512, and filters into your Git repo.
 
 
 ---
 
-7. After all agents are ARM64, remove canary
+Option 3 — Download tarball yourself and generate SHA512
 
-Remove the canary resource from kustomization.yaml, delete the canary file, then commit:
+If the asset tarball is in GitHub Releases, Bonsai, S3, or Artifactory, download it and calculate checksum:
 
-git rm overlays/stg/sensu-agent-arm64-canary.yaml
-git add overlays/stg/kustomization.yaml
-git commit -m "Remove Sensu arm64 canary agent"
-git push
+curl -L -o asset_linux_arm64.tar.gz "<asset-tarball-url>"
+sha512sum asset_linux_arm64.tar.gz
 
-argocd app sync ${ARGO_APP}
-argocd app wait ${ARGO_APP} --sync --health --timeout 600
+Then use the output in YAML:
 
-Remove node label:
+- url: https://your-artifact-store/asset_linux_arm64.tar.gz
+  sha512: <output-from-sha512sum>
+  filters:
+    - entity.system.os == 'linux'
+    - entity.system.arch == 'arm64'
 
-kubectl label node ${ARM_NODE} sensu-arm64-canary-
+Sensu docs also show this packaging flow: create a .tar.gz, generate sha512sum, and host the tarball on a platform such as GitLab, Bitbucket, Artifactory, Apache, or NGINX. 
 
-Final check:
+What to do now
 
-kubectl get pods -n ${NS} -o wide
-sensuctl event list
-sensuctl entity list
+Since your asset files do not have sha512, fix them before moving agents to ARM64.
 
-This gives you one clean path: assets first, backend ARM64, canary agent ARM64, then all agents ARM64.
+Run:
+
+grep -R "sha512" .
+grep -R "url:" .
+grep -R "arm64" .
+
+Each ARM64 build should look like this:
+
+- url: https://assets.bonsai.sensu.io/.../http-checks_<version>_linux_arm64.tar.gz
+  sha512: <arm64-sha512>
+  filters:
+    - entity.system.os == 'linux'
+    - entity.system.arch == 'arm64'
+
+My recommendation
+
+For your case:
+
+Use Bonsai tarball URLs + SHA512 where available.
+Mirror the tarballs to your internal S3/Artifactory if production reliability/security requires it.
+Generate SHA512 yourself only for assets you build or mirror.
+
+Do not leave sha512 blank. Sensu uses it to verify the asset before unpacking and running it.
