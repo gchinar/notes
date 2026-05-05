@@ -1,108 +1,141 @@
-Yes — sha512 should be in the Sensu Asset definition.
+There is no single AWS CLI command that auto-creates WAF the same way the CloudFront console “one-click protection” does. That one-click flow is a console feature that creates a WAF Web ACL, adds recommended protections, and attaches it to the distribution. 
 
-A Sensu dynamic runtime asset build is made of:
+CLI equivalent = create WAF first, then create CloudFront distribution with that WAF ARN attached.
 
-url: <asset-tar.gz-url>
-sha512: <checksum>
-filters:
-  - entity.system.os == 'linux'
-  - entity.system.arch == 'arm64'
+1. Create WAF rules file
 
-Sensu docs describe an asset build as the combination of an artifact URL, SHA512 checksum, and optional filters; Sensu downloads the artifact from the URL and only unpacks it if the downloaded file’s SHA512 matches the configured checksum. 
+Create waf-rules.json:
 
-Where to get the asset tar file
+[
+  {
+    "Name": "AWS-AWSManagedRulesCommonRuleSet",
+    "Priority": 0,
+    "Statement": {
+      "ManagedRuleGroupStatement": {
+        "VendorName": "AWS",
+        "Name": "AWSManagedRulesCommonRuleSet"
+      }
+    },
+    "OverrideAction": {
+      "Count": {}
+    },
+    "VisibilityConfig": {
+      "SampledRequestsEnabled": true,
+      "CloudWatchMetricsEnabled": true,
+      "MetricName": "AWSManagedRulesCommonRuleSet"
+    }
+  },
+  {
+    "Name": "AWS-AWSManagedRulesAmazonIpReputationList",
+    "Priority": 1,
+    "Statement": {
+      "ManagedRuleGroupStatement": {
+        "VendorName": "AWS",
+        "Name": "AWSManagedRulesAmazonIpReputationList"
+      }
+    },
+    "OverrideAction": {
+      "Count": {}
+    },
+    "VisibilityConfig": {
+      "SampledRequestsEnabled": true,
+      "CloudWatchMetricsEnabled": true,
+      "MetricName": "AWSManagedRulesAmazonIpReputationList"
+    }
+  }
+]
 
-You have 3 options.
+I used Count mode so production traffic is not blocked immediately. Later, change "Count": {} to "None": {} after checking WAF logs.
 
-Option 1 — From Bonsai asset definition
+2. Create WAF Web ACL for CloudFront
 
-For public Sensu assets, Bonsai usually provides the asset tarball URL and SHA512 in the asset definition.
+WEB_ACL_ARN=$(aws wafv2 create-web-acl \
+  --profile prod \
+  --region us-east-1 \
+  --name prod-cloudfront-waf \
+  --scope CLOUDFRONT \
+  --default-action '{"Allow":{}}' \
+  --visibility-config '{"SampledRequestsEnabled":true,"CloudWatchMetricsEnabled":true,"MetricName":"prod-cloudfront-waf"}' \
+  --rules file://waf-rules.json \
+  --query 'Summary.ARN' \
+  --output text)
 
-Example from Bonsai-style asset YAML:
+echo "$WEB_ACL_ARN"
 
-spec:
-  builds:
-    - url: https://assets.bonsai.sensu.io/.../asset_linux_arm64.tar.gz
-      sha512: <sha512>
-      filters:
-        - entity.system.os == 'linux'
-        - entity.system.arch == 'arm64'
+For CloudFront WAF, the scope must be CLOUDFRONT, and AWS requires the WAF API call to use us-east-1. 
 
-Bonsai asset pages can include an “Asset definition” section with the url and sha512; for example, the sensu-plugins-http Bonsai page shows a tarball URL under assets.bonsai.sensu.io and its SHA512. 
+3. Create CloudFront distribution config with WAF attached
 
+Create distribution-config.json:
 
----
+cat > distribution-config.json <<EOF
+{
+  "CallerReference": "prod-$(date +%s)",
+  "Comment": "Production CloudFront distribution with WAF",
+  "Enabled": true,
+  "Aliases": {
+    "Quantity": 0
+  },
+  "Origins": {
+    "Quantity": 1,
+    "Items": [
+      {
+        "Id": "app-origin",
+        "DomainName": "REPLACE_WITH_ORIGIN_DOMAIN",
+        "CustomOriginConfig": {
+          "HTTPPort": 80,
+          "HTTPSPort": 443,
+          "OriginProtocolPolicy": "https-only",
+          "OriginSslProtocols": {
+            "Quantity": 1,
+            "Items": ["TLSv1.2"]
+          },
+          "OriginReadTimeout": 30,
+          "OriginKeepaliveTimeout": 5
+        }
+      }
+    ]
+  },
+  "DefaultCacheBehavior": {
+    "TargetOriginId": "app-origin",
+    "ViewerProtocolPolicy": "redirect-to-https",
+    "AllowedMethods": {
+      "Quantity": 2,
+      "Items": ["GET", "HEAD"],
+      "CachedMethods": {
+        "Quantity": 2,
+        "Items": ["GET", "HEAD"]
+      }
+    },
+    "Compress": true,
+    "CachePolicyId": "658327ea-f89d-4fab-a63d-7e88639e58f6"
+  },
+  "PriceClass": "PriceClass_All",
+  "ViewerCertificate": {
+    "CloudFrontDefaultCertificate": true
+  },
+  "Restrictions": {
+    "GeoRestriction": {
+      "RestrictionType": "none",
+      "Quantity": 0
+    }
+  },
+  "WebACLId": "$WEB_ACL_ARN"
+}
+EOF
 
-Option 2 — Use sensuctl asset add to generate the definition
+For AWS WAF v2, CloudFront expects the Web ACL ARN in the distribution config’s WebACLId field. 
 
-This is the easiest way.
+4. Create the distribution
 
-Sensu docs say you can install an asset definition directly from Bonsai using:
+aws cloudfront create-distribution \
+  --profile prod \
+  --distribution-config file://distribution-config.json
 
-sensuctl asset add <ASSET_NAME>:<ASSET_VERSION>
+Replace REPLACE_WITH_ORIGIN_DOMAIN with your real origin, for example:
 
-They also recommend pinning a version instead of using latest, because latest can introduce breaking changes. 
+my-prod-alb-123456.ap-northeast-1.elb.amazonaws.com
 
-For your assets, run these in a scratch/dev Sensu backend, not directly in GitOps-managed STG if you want to avoid ArgoCD drift:
+or your API/custom origin domain.
 
-sensuctl asset add sensu/http-checks:<version> --rename http-check
-sensuctl asset add sensu/sensu-aggregate-check:<version> --rename aggregate-check
-sensuctl asset add sensu/sensu-aws-sns-handler:<version> --rename aws-sns-handler
-sensuctl asset add sensu/sensu-cloudwatch-check:<version> --rename cloudwatch-check
-sensuctl asset add sensu-plugins/sensu-plugins-aws:<version> --rename plugins-aws
-sensuctl asset add sensu-plugins/sensu-plugins-http:<version> --rename plugins-http
-sensuctl asset add sensu/sensu-ruby-runtime:<version> --rename ruby-runtime
-
-Then export the generated asset YAML:
-
-sensuctl asset list --format yaml > generated-assets.yaml
-
-From that file, copy the url, sha512, and filters into your Git repo.
-
-
----
-
-Option 3 — Download tarball yourself and generate SHA512
-
-If the asset tarball is in GitHub Releases, Bonsai, S3, or Artifactory, download it and calculate checksum:
-
-curl -L -o asset_linux_arm64.tar.gz "<asset-tarball-url>"
-sha512sum asset_linux_arm64.tar.gz
-
-Then use the output in YAML:
-
-- url: https://your-artifact-store/asset_linux_arm64.tar.gz
-  sha512: <output-from-sha512sum>
-  filters:
-    - entity.system.os == 'linux'
-    - entity.system.arch == 'arm64'
-
-Sensu docs also show this packaging flow: create a .tar.gz, generate sha512sum, and host the tarball on a platform such as GitLab, Bitbucket, Artifactory, Apache, or NGINX. 
-
-What to do now
-
-Since your asset files do not have sha512, fix them before moving agents to ARM64.
-
-Run:
-
-grep -R "sha512" .
-grep -R "url:" .
-grep -R "arm64" .
-
-Each ARM64 build should look like this:
-
-- url: https://assets.bonsai.sensu.io/.../http-checks_<version>_linux_arm64.tar.gz
-  sha512: <arm64-sha512>
-  filters:
-    - entity.system.os == 'linux'
-    - entity.system.arch == 'arm64'
-
-My recommendation
-
-For your case:
-
-Use Bonsai tarball URLs + SHA512 where available.
-Mirror the tarballs to your internal S3/Artifactory if production reliability/security requires it.
-Generate SHA512 yourself only for assets you build or mirror.
-
-Do not leave sha512 blank. Sensu uses it to verify the asset before unpacking and running it.
+In your case, since you’re copying from staging, compare origins, behaviors, cache policies, origin request policies, and WAF rules carefully; a WAF block can make /api/* look broken before the request even reaches the origin. 
