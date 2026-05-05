@@ -1,141 +1,233 @@
-There is no single AWS CLI command that auto-creates WAF the same way the CloudFront console “one-click protection” does. That one-click flow is a console feature that creates a WAF Web ACL, adds recommended protections, and attaches it to the distribution. 
+Yes. For production, you need to create/publish the same CloudFront Function in the production account, then associate the production function ARN with the production distribution’s cache behavior.
 
-CLI equivalent = create WAF first, then create CloudFront distribution with that WAF ARN attached.
+You generally cannot attach the staging account’s function ARN directly to the production account distribution. Copy the function code/config and recreate it in prod.
 
-1. Create WAF rules file
+CloudFront Functions must be published to the LIVE stage before association with a cache behavior. AWS documents that FunctionAssociations require the function to be LIVE. 
 
-Create waf-rules.json:
 
-[
-  {
-    "Name": "AWS-AWSManagedRulesCommonRuleSet",
-    "Priority": 0,
-    "Statement": {
-      "ManagedRuleGroupStatement": {
-        "VendorName": "AWS",
-        "Name": "AWSManagedRulesCommonRuleSet"
-      }
-    },
-    "OverrideAction": {
-      "Count": {}
-    },
-    "VisibilityConfig": {
-      "SampledRequestsEnabled": true,
-      "CloudWatchMetricsEnabled": true,
-      "MetricName": "AWSManagedRulesCommonRuleSet"
-    }
-  },
-  {
-    "Name": "AWS-AWSManagedRulesAmazonIpReputationList",
-    "Priority": 1,
-    "Statement": {
-      "ManagedRuleGroupStatement": {
-        "VendorName": "AWS",
-        "Name": "AWSManagedRulesAmazonIpReputationList"
-      }
-    },
-    "OverrideAction": {
-      "Count": {}
-    },
-    "VisibilityConfig": {
-      "SampledRequestsEnabled": true,
-      "CloudWatchMetricsEnabled": true,
-      "MetricName": "AWSManagedRulesAmazonIpReputationList"
-    }
-  }
-]
+---
 
-I used Count mode so production traffic is not blocked immediately. Later, change "Count": {} to "None": {} after checking WAF logs.
+Option A — Console steps
 
-2. Create WAF Web ACL for CloudFront
+In production account:
 
-WEB_ACL_ARN=$(aws wafv2 create-web-acl \
-  --profile prod \
-  --region us-east-1 \
-  --name prod-cloudfront-waf \
-  --scope CLOUDFRONT \
-  --default-action '{"Allow":{}}' \
-  --visibility-config '{"SampledRequestsEnabled":true,"CloudWatchMetricsEnabled":true,"MetricName":"prod-cloudfront-waf"}' \
-  --rules file://waf-rules.json \
-  --query 'Summary.ARN' \
+1. Go to CloudFront → Functions
+
+
+2. Create a new function with the same code as staging
+
+
+3. Test it
+
+
+4. Publish it
+
+
+5. Go to CloudFront → Distributions → your prod distribution
+
+
+6. Open the relevant Cache behavior
+
+
+7. Edit → Function associations
+
+
+8. Select:
+
+Event type: usually Viewer request
+
+Function: your new prod CloudFront Function
+
+
+
+9. Save changes
+
+
+
+CloudFront Functions support viewer-side events like viewer-request and viewer-response; origin-side events are for Lambda@Edge, not CloudFront Functions. 
+
+
+---
+
+Option B — AWS CLI: copy staging function to prod and associate it
+
+Set variables:
+
+STG_PROFILE=staging
+PRD_PROFILE=prod
+
+STG_FUNCTION_NAME="your-staging-function-name"
+PRD_FUNCTION_NAME="your-prod-function-name"
+
+PROD_DISTRIBUTION_ID="E1234567890ABC"
+
+# Usually viewer-request, but check staging.
+EVENT_TYPE="viewer-request"
+
+# For default cache behavior, set this empty:
+PATH_PATTERN=""
+
+# For an ordered cache behavior, example:
+# PATH_PATTERN="/api/*"
+
+1. Download staging function code
+
+aws cloudfront get-function \
+  --profile "$STG_PROFILE" \
+  --name "$STG_FUNCTION_NAME" \
+  --stage LIVE \
+  staging-function.js
+
+get-function retrieves the code of a CloudFront Function; config/metadata is retrieved separately with describe-function. 
+
+2. Create the same function in prod
+
+aws cloudfront create-function \
+  --profile "$PRD_PROFILE" \
+  --name "$PRD_FUNCTION_NAME" \
+  --function-config "Comment=Copied from staging,Runtime=cloudfront-js-2.0" \
+  --function-code fileb://staging-function.js
+
+When created, the function starts in DEVELOPMENT; AWS says you must publish it to LIVE before attaching it to a distribution. 
+
+3. Publish the prod function
+
+PROD_FUNCTION_ETAG=$(aws cloudfront describe-function \
+  --profile "$PRD_PROFILE" \
+  --name "$PRD_FUNCTION_NAME" \
+  --query 'ETag' \
   --output text)
 
-echo "$WEB_ACL_ARN"
+aws cloudfront publish-function \
+  --profile "$PRD_PROFILE" \
+  --name "$PRD_FUNCTION_NAME" \
+  --if-match "$PROD_FUNCTION_ETAG"
 
-For CloudFront WAF, the scope must be CLOUDFRONT, and AWS requires the WAF API call to use us-east-1. 
+Publishing requires the current function ETag, passed as --if-match. 
 
-3. Create CloudFront distribution config with WAF attached
+4. Get the prod function ARN
 
-Create distribution-config.json:
+PROD_FUNCTION_ARN=$(aws cloudfront describe-function \
+  --profile "$PRD_PROFILE" \
+  --name "$PRD_FUNCTION_NAME" \
+  --stage LIVE \
+  --query 'FunctionSummary.FunctionMetadata.FunctionARN' \
+  --output text)
 
-cat > distribution-config.json <<EOF
-{
-  "CallerReference": "prod-$(date +%s)",
-  "Comment": "Production CloudFront distribution with WAF",
-  "Enabled": true,
-  "Aliases": {
-    "Quantity": 0
-  },
-  "Origins": {
-    "Quantity": 1,
-    "Items": [
-      {
-        "Id": "app-origin",
-        "DomainName": "REPLACE_WITH_ORIGIN_DOMAIN",
-        "CustomOriginConfig": {
-          "HTTPPort": 80,
-          "HTTPSPort": 443,
-          "OriginProtocolPolicy": "https-only",
-          "OriginSslProtocols": {
-            "Quantity": 1,
-            "Items": ["TLSv1.2"]
-          },
-          "OriginReadTimeout": 30,
-          "OriginKeepaliveTimeout": 5
-        }
-      }
-    ]
-  },
-  "DefaultCacheBehavior": {
-    "TargetOriginId": "app-origin",
-    "ViewerProtocolPolicy": "redirect-to-https",
-    "AllowedMethods": {
-      "Quantity": 2,
-      "Items": ["GET", "HEAD"],
-      "CachedMethods": {
-        "Quantity": 2,
-        "Items": ["GET", "HEAD"]
-      }
-    },
-    "Compress": true,
-    "CachePolicyId": "658327ea-f89d-4fab-a63d-7e88639e58f6"
-  },
-  "PriceClass": "PriceClass_All",
-  "ViewerCertificate": {
-    "CloudFrontDefaultCertificate": true
-  },
-  "Restrictions": {
-    "GeoRestriction": {
-      "RestrictionType": "none",
-      "Quantity": 0
-    }
-  },
-  "WebACLId": "$WEB_ACL_ARN"
-}
-EOF
+echo "$PROD_FUNCTION_ARN"
 
-For AWS WAF v2, CloudFront expects the Web ACL ARN in the distribution config’s WebACLId field. 
+5. Download prod distribution config
 
-4. Create the distribution
+aws cloudfront get-distribution-config \
+  --profile "$PRD_PROFILE" \
+  --id "$PROD_DISTRIBUTION_ID" \
+  --output json > prod-dist-raw.json
 
-aws cloudfront create-distribution \
-  --profile prod \
-  --distribution-config file://distribution-config.json
+DIST_ETAG=$(jq -r '.ETag' prod-dist-raw.json)
 
-Replace REPLACE_WITH_ORIGIN_DOMAIN with your real origin, for example:
+CloudFront distribution updates require the current config plus the distribution ETag as If-Match. 
 
-my-prod-alb-123456.ap-northeast-1.elb.amazonaws.com
 
-or your API/custom origin domain.
+---
 
-In your case, since you’re copying from staging, compare origins, behaviors, cache policies, origin request policies, and WAF rules carefully; a WAF block can make /api/* look broken before the request even reaches the origin. 
+6A. Associate function with default cache behavior
+
+Use this if staging has the function on the Default cache behavior:
+
+jq \
+  --arg arn "$PROD_FUNCTION_ARN" \
+  --arg event "$EVENT_TYPE" '
+  def upsert_func_assoc($arn; $event):
+    ((.FunctionAssociations.Items // [])
+      | map(select(.EventType != $event))
+      + [{"EventType": $event, "FunctionARN": $arn}]
+    ) as $items
+    | .FunctionAssociations = {
+        "Quantity": ($items | length),
+        "Items": $items
+      };
+
+  .DistributionConfig.DefaultCacheBehavior |= upsert_func_assoc($arn; $event)
+  | .DistributionConfig
+' prod-dist-raw.json > prod-dist-updated.json
+
+Then update the distribution:
+
+aws cloudfront update-distribution \
+  --profile "$PRD_PROFILE" \
+  --id "$PROD_DISTRIBUTION_ID" \
+  --if-match "$DIST_ETAG" \
+  --distribution-config file://prod-dist-updated.json
+
+
+---
+
+6B. Associate function with an ordered cache behavior, like /api/*
+
+Use this if staging has the function on a specific cache behavior:
+
+PATH_PATTERN="/api/*"
+
+jq \
+  --arg arn "$PROD_FUNCTION_ARN" \
+  --arg event "$EVENT_TYPE" \
+  --arg path "$PATH_PATTERN" '
+  def upsert_func_assoc($arn; $event):
+    ((.FunctionAssociations.Items // [])
+      | map(select(.EventType != $event))
+      + [{"EventType": $event, "FunctionARN": $arn}]
+    ) as $items
+    | .FunctionAssociations = {
+        "Quantity": ($items | length),
+        "Items": $items
+      };
+
+  .DistributionConfig.CacheBehaviors.Items |=
+    map(
+      if .PathPattern == $path
+      then upsert_func_assoc($arn; $event)
+      else .
+      end
+    )
+  | .DistributionConfig
+' prod-dist-raw.json > prod-dist-updated.json
+
+Then update:
+
+aws cloudfront update-distribution \
+  --profile "$PRD_PROFILE" \
+  --id "$PROD_DISTRIBUTION_ID" \
+  --if-match "$DIST_ETAG" \
+  --distribution-config file://prod-dist-updated.json
+
+
+---
+
+Important checks before applying
+
+Compare staging vs prod:
+
+aws cloudfront get-distribution-config \
+  --profile "$STG_PROFILE" \
+  --id "STAGING_DISTRIBUTION_ID" \
+  --query 'DistributionConfig.DefaultCacheBehavior.FunctionAssociations'
+
+For ordered behaviors:
+
+aws cloudfront get-distribution-config \
+  --profile "$STG_PROFILE" \
+  --id "STAGING_DISTRIBUTION_ID" \
+  --query 'DistributionConfig.CacheBehaviors.Items[].{PathPattern:PathPattern,FunctionAssociations:FunctionAssociations}'
+
+Make sure you copy:
+
+Staging setting	Prod should match
+
+Event type	viewer-request or viewer-response
+Cache behavior	Default or specific path like /api/*
+Function code	Same logic, unless prod domain/env differs
+Runtime	Usually cloudfront-js-2.0
+Function publish status	Must be LIVE
+
+
+Given your CloudFront issue context, pay close attention to whether the function rewrites paths, redirects, normalizes URLs, or changes headers. A small difference there can make /api/* route differently between staging and production. 
