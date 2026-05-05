@@ -1,54 +1,66 @@
-Yes — do it one at a time, but I would slightly change the order:
+Great — that removes the biggest blocker.
 
-1. Add Graviton nodes
-2. Test Sensu ARM image with backend or canary agent
-3. Convert/update assets to ARM64
-4. Move Sensu agents to ARM64
-5. Remove AMD64 scheduling
+Now your next step should be controlled ARM64 testing in STG, not full cutover immediately.
 
-Do not move all Sensu agents to ARM first and then fix assets. Your checks will likely fail because your assets are still AMD64-only.
+Recommended next sequence
 
-Recommended sequence
+1. Validate asset YAML locally
 
-Step 1 — Add Graviton nodes
+Make sure every asset has both builds:
 
-Add ARM64 node group/Karpenter capacity, preferably tainted:
+filters:
+  - entity.system.os == 'linux'
+  - entity.system.arch == 'amd64'
 
-taints:
-  - key: graviton
-    value: "true"
-    effect: NoSchedule
+and:
 
-This prevents accidental scheduling.
+filters:
+  - entity.system.os == 'linux'
+  - entity.system.arch == 'arm64'
 
+Also verify the sha512 values are correct for each ARM64 tarball.
 
----
+Run:
 
-Step 2 — Change Sensu image to multi-arch/ARM-compatible
-
-Use a multi-arch Sensu image, for example:
-
-image: sensu/sensu:<validated-version>
-
-Do not force an ARM64 digest yet unless you are sure. If the image is multi-arch, Kubernetes will pull the correct architecture based on the node.
-
-Test:
-
-docker buildx imagetools inspect sensu/sensu:<version>
-
-You want to see:
-
-linux/amd64
-linux/arm64
+grep -R "entity.system.arch" .
+grep -R "arm64" .
+grep -R "sha512" .
 
 
 ---
 
-Step 3 — Move only the Sensu backend first
+2. Let ArgoCD sync assets first
 
-This is usually safer than moving agents first.
+Sync only the asset YAML changes first if possible.
 
-Patch backend only:
+Then confirm Sensu sees the updated assets:
+
+sensuctl asset list --format yaml
+
+For each asset, confirm both amd64 and arm64 builds are present.
+
+
+---
+
+3. Keep agents on AMD64 for now
+
+At this point, do not move all agents yet.
+
+Your assets now support ARM64, but you still need to prove:
+
+ARM64 asset downloads correctly
+ARM64 asset unpacks correctly
+ARM64 binary/script executes correctly
+Check command works on ARM64 node
+
+
+---
+
+4. Add one ARM64 test agent first
+
+Best option: create a canary Sensu agent on Graviton.
+
+For example, create a separate STG agent deployment/daemonset with:
 
 nodeSelector:
   kubernetes.io/arch: arm64
@@ -59,126 +71,98 @@ tolerations:
     value: "true"
     effect: NoSchedule
 
+Give this canary agent a special subscription, for example:
+
+subscriptions:
+  - stg-arm64-canary
+
+Then run a small subset of checks against that subscription first.
+
+
+---
+
+5. Test each asset-backed check
+
+For each check, temporarily target the canary subscription:
+
+subscriptions:
+  - stg-arm64-canary
+
 Then validate:
+
+sensuctl event list
+sensuctl entity list
+kubectl logs -n <sensu-namespace> <arm64-agent-pod>
+
+Look for these errors:
+
+exec format error
+no matching asset build
+failed to fetch asset
+permission denied
+command not found
+ruby: not found
+library not found
+
+exec format error usually means the artifact is still AMD64 or packaged incorrectly.
+
+
+---
+
+6. Move backend to ARM64
+
+After asset YAML is synced, you can move the Sensu backend to ARM64 if backend-side handlers/mutators/assets are also ARM64-ready.
+
+Patch backend:
+
+nodeSelector:
+  kubernetes.io/arch: arm64
+
+With taint support if needed:
+
+tolerations:
+  - key: graviton
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
+
+Validate:
 
 kubectl get pods -n <sensu-namespace> -o wide
 kubectl logs -n <sensu-namespace> deploy/sensu-backend
 sensuctl cluster health
-sensuctl entity list
-
-But note: if your handlers/mutators use runtime assets, those assets must also support ARM64 before backend migration.
+sensuctl event list
 
 
 ---
 
-Step 4 — Do not move agents yet
+7. Move all agents to ARM64
 
-Agents run most checks. Since your check assets are currently AMD64-only, ARM agents will register, but checks using those assets may fail.
-
-So keep agents on AMD64 temporarily while you convert assets:
-
-nodeSelector:
-  kubernetes.io/arch: amd64
-
-This is still a phased migration, not the final state.
-
-
----
-
-Step 5 — Convert assets one by one
-
-For each asset:
-
-http-check
-aggregate-check
-aws-sns-handler
-cloudwatch-check
-plugins-aws
-plugins-http
-ruby-runtime
-
-Add ARM64 builds under the same asset names.
-
-Example:
-
-type: Asset
-api_version: core/v2
-metadata:
-  name: http-check
-spec:
-  builds:
-    - url: <amd64-url>
-      sha512: <amd64-sha>
-      filters:
-        - entity.system.os == 'linux'
-        - entity.system.arch == 'amd64'
-
-    - url: <arm64-url>
-      sha512: <arm64-sha>
-      filters:
-        - entity.system.os == 'linux'
-        - entity.system.arch == 'arm64'
-
-Your checks stay unchanged:
-
-runtime_assets:
-  - http-check
-
-
----
-
-Step 6 — Move Sensu agents to Graviton
-
-Only after all required assets have ARM64 builds, patch the agent DaemonSet:
+Only after canary checks pass, update the main agent DaemonSet:
 
 nodeSelector:
   kubernetes.io/arch: arm64
 
-tolerations:
-  - key: graviton
-    operator: Equal
-    value: "true"
-    effect: NoSchedule
+Then let ArgoCD sync.
 
-Then validate:
+Validate:
 
 kubectl get pods -n <sensu-namespace> -o wide
+kubectl get nodes -L kubernetes.io/arch
 sensuctl entity list
 sensuctl event list
-kubectl logs -n <sensu-namespace> daemonset/sensu-agent
-
-Look for asset errors like:
-
-no matching asset build
-exec format error
-failed to fetch asset
 
 
 ---
 
-So your proposed order?
+The order I recommend now
 
-> First image in ARM. If it works, then move assets.
+1. Sync updated asset YAML.
+2. Confirm both amd64 and arm64 builds in Sensu.
+3. Add one ARM64 canary agent.
+4. Test checks one by one on the ARM64 canary.
+5. Move backend to ARM64.
+6. Move all agents to ARM64.
+7. Remove AMD64 nodes after STG is stable.
 
-
-
-I would adjust it to:
-
-First: Sensu image + backend on ARM
-Second: Convert assets
-Third: Sensu agents on ARM
-
-Because the backend image can prove Sensu itself runs on Graviton. But agents should not move until assets are ARM-ready.
-
-Final recommended STG order
-
-1. Add Graviton nodes with taint.
-2. Use ARM64/multi-arch Sensu image.
-3. Move backend to ARM64.
-4. Validate backend.
-5. Add ARM64 asset builds.
-6. Move agents to ARM64.
-7. Validate all checks/events.
-8. Remove AMD64 dependency.
-
-That gives you a clean, low-risk path to Graviton-only without breaking all checks at once.
+Your current state is good: assets now having both AMD64 and ARM64 is exactly the right GitOps pattern. Now validate with a canary before flipping all Sensu agents to Graviton.
