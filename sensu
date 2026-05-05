@@ -1,168 +1,285 @@
-Great — that removes the biggest blocker.
+Use this one approach:
 
-Now your next step should be controlled ARM64 testing in STG, not full cutover immediately.
+Sync ARM64 assets → move backend to ARM64 → test one ARM64 canary agent → move all agents to ARM64
 
-Recommended next sequence
+Assume:
 
-1. Validate asset YAML locally
+export NS=sensu
+export ARGO_APP=sensu-stg
+export BACKEND_NAME=sensu-backend
+export AGENT_DS=sensu-agent
+export SENSU_IMAGE="sensu/sensu:6.14.0"
 
-Make sure every asset has both builds:
-
-filters:
-  - entity.system.os == 'linux'
-  - entity.system.arch == 'amd64'
-
-and:
-
-filters:
-  - entity.system.os == 'linux'
-  - entity.system.arch == 'arm64'
-
-Also verify the sha512 values are correct for each ARM64 tarball.
-
-Run:
-
-grep -R "entity.system.arch" .
-grep -R "arm64" .
-grep -R "sha512" .
+Change names if yours are different.
 
 
 ---
 
-2. Let ArgoCD sync assets first
+1. Verify Graviton nodes exist
 
-Sync only the asset YAML changes first if possible.
+kubectl get nodes -L kubernetes.io/arch
 
-Then confirm Sensu sees the updated assets:
+You should see at least one node with:
 
-sensuctl asset list --format yaml
+arm64
 
-For each asset, confirm both amd64 and arm64 builds are present.
+Check only ARM64 nodes:
 
-
----
-
-3. Keep agents on AMD64 for now
-
-At this point, do not move all agents yet.
-
-Your assets now support ARM64, but you still need to prove:
-
-ARM64 asset downloads correctly
-ARM64 asset unpacks correctly
-ARM64 binary/script executes correctly
-Check command works on ARM64 node
+kubectl get nodes -l kubernetes.io/arch=arm64
 
 
 ---
 
-4. Add one ARM64 test agent first
+2. Verify Sensu image supports ARM64
 
-Best option: create a canary Sensu agent on Graviton.
+docker buildx imagetools inspect ${SENSU_IMAGE} | grep -E "linux/(amd64|arm64)"
 
-For example, create a separate STG agent deployment/daemonset with:
+Expected:
 
-nodeSelector:
-  kubernetes.io/arch: arm64
-
-tolerations:
-  - key: graviton
-    operator: Equal
-    value: "true"
-    effect: NoSchedule
-
-Give this canary agent a special subscription, for example:
-
-subscriptions:
-  - stg-arm64-canary
-
-Then run a small subset of checks against that subscription first.
+linux/amd64
+linux/arm64
 
 
 ---
 
-5. Test each asset-backed check
+3. Sync your updated assets first
 
-For each check, temporarily target the canary subscription:
+Since you already added both amd64 and arm64 asset builds, commit that first.
 
-subscriptions:
-  - stg-arm64-canary
+git status
+git add .
+git commit -m "Add arm64 builds for Sensu assets"
+git push
 
-Then validate:
+Sync ArgoCD:
 
-sensuctl event list
+argocd app diff ${ARGO_APP}
+argocd app sync ${ARGO_APP}
+argocd app wait ${ARGO_APP} --sync --health --timeout 600
+
+Verify Sensu sees both architectures:
+
+sensuctl asset list --format yaml | grep -E "name:|amd64|arm64"
+
+
+---
+
+4. Move Sensu backend to ARM64
+
+Create a Kustomize patch:
+
+mkdir -p overlays/stg/patches
+cat > overlays/stg/patches/sensu-backend-arm64.yaml <<'EOF'
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sensu-backend
+spec:
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      tolerations:
+        - key: graviton
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+EOF
+
+If your backend is a Deployment, change this line:
+
+kind: StatefulSet
+
+to:
+
+kind: Deployment
+
+Add patch to overlays/stg/kustomization.yaml:
+
+cat >> overlays/stg/kustomization.yaml <<'EOF'
+
+patches:
+  - path: patches/sensu-backend-arm64.yaml
+EOF
+
+If your kustomization.yaml already has patches:, add only this line under it:
+
+- path: patches/sensu-backend-arm64.yaml
+
+Commit and sync:
+
+git add overlays/stg
+git commit -m "Move Sensu backend to arm64 in STG"
+git push
+
+argocd app sync ${ARGO_APP}
+argocd app wait ${ARGO_APP} --sync --health --timeout 600
+
+Validate:
+
+kubectl get pods -n ${NS} -o wide | grep sensu-backend
+kubectl logs -n ${NS} sts/${BACKEND_NAME} --tail=100
 sensuctl entity list
-kubectl logs -n <sensu-namespace> <arm64-agent-pod>
+sensuctl event list
+
+If backend is a deployment:
+
+kubectl logs -n ${NS} deploy/${BACKEND_NAME} --tail=100
+
+
+---
+
+5. Test one ARM64 canary agent
+
+Label one ARM64 node:
+
+ARM_NODE=$(kubectl get nodes -l kubernetes.io/arch=arm64 -o jsonpath='{.items[0].metadata.name}')
+kubectl label node ${ARM_NODE} sensu-arm64-canary=true --overwrite
+
+Create a canary patch by copying your existing agent DaemonSet YAML into a new manifest is safest. If you already have the agent manifest in Git, copy it:
+
+cp base/sensu-agent.yaml overlays/stg/sensu-agent-arm64-canary.yaml
+
+Edit the copied file:
+
+vi overlays/stg/sensu-agent-arm64-canary.yaml
+
+Change these fields:
+
+metadata:
+  name: sensu-agent-arm64-canary
+
+spec:
+  selector:
+    matchLabels:
+      app: sensu-agent-arm64-canary
+
+  template:
+    metadata:
+      labels:
+        app: sensu-agent-arm64-canary
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: arm64
+        sensu-arm64-canary: "true"
+      tolerations:
+        - key: graviton
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+
+Also make sure the canary agent has a separate subscription, for example:
+
+stg-arm64-canary
+
+Add the canary manifest to overlays/stg/kustomization.yaml:
+
+resources:
+  - sensu-agent-arm64-canary.yaml
+
+Commit and sync:
+
+git add overlays/stg
+git commit -m "Add Sensu arm64 canary agent in STG"
+git push
+
+argocd app sync ${ARGO_APP}
+argocd app wait ${ARGO_APP} --sync --health --timeout 600
+
+Validate canary pod is on ARM64:
+
+kubectl get pods -n ${NS} -o wide | grep sensu-agent-arm64-canary
+kubectl get node ${ARM_NODE} -o jsonpath='{.metadata.labels.kubernetes\.io/arch}'; echo
+
+Expected:
+
+arm64
+
+Check Sensu entity:
+
+sensuctl entity list | grep arm64
+sensuctl event list
+
+Check logs:
+
+kubectl logs -n ${NS} ds/sensu-agent-arm64-canary --tail=200
 
 Look for these errors:
 
 exec format error
 no matching asset build
 failed to fetch asset
+ruby not found
 permission denied
-command not found
-ruby: not found
-library not found
-
-exec format error usually means the artifact is still AMD64 or packaged incorrectly.
 
 
 ---
 
-6. Move backend to ARM64
+6. Move main Sensu agent DaemonSet to ARM64
 
-After asset YAML is synced, you can move the Sensu backend to ARM64 if backend-side handlers/mutators/assets are also ARM64-ready.
+Only after the canary works, create the main agent patch:
 
-Patch backend:
+cat > overlays/stg/patches/sensu-agent-arm64.yaml <<'EOF'
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: sensu-agent
+spec:
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      tolerations:
+        - key: graviton
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+EOF
 
-nodeSelector:
-  kubernetes.io/arch: arm64
+Add it to kustomization.yaml under patches:
 
-With taint support if needed:
+- path: patches/sensu-agent-arm64.yaml
 
-tolerations:
-  - key: graviton
-    operator: Equal
-    value: "true"
-    effect: NoSchedule
+Commit and sync:
 
-Validate:
+git add overlays/stg
+git commit -m "Move Sensu agents to arm64 in STG"
+git push
 
-kubectl get pods -n <sensu-namespace> -o wide
-kubectl logs -n <sensu-namespace> deploy/sensu-backend
-sensuctl cluster health
-sensuctl event list
-
-
----
-
-7. Move all agents to ARM64
-
-Only after canary checks pass, update the main agent DaemonSet:
-
-nodeSelector:
-  kubernetes.io/arch: arm64
-
-Then let ArgoCD sync.
+argocd app sync ${ARGO_APP}
+argocd app wait ${ARGO_APP} --sync --health --timeout 600
 
 Validate:
 
-kubectl get pods -n <sensu-namespace> -o wide
+kubectl get pods -n ${NS} -o wide | grep sensu-agent
 kubectl get nodes -L kubernetes.io/arch
 sensuctl entity list
 sensuctl event list
+kubectl logs -n ${NS} ds/${AGENT_DS} --tail=200
 
 
 ---
 
-The order I recommend now
+7. After all agents are ARM64, remove canary
 
-1. Sync updated asset YAML.
-2. Confirm both amd64 and arm64 builds in Sensu.
-3. Add one ARM64 canary agent.
-4. Test checks one by one on the ARM64 canary.
-5. Move backend to ARM64.
-6. Move all agents to ARM64.
-7. Remove AMD64 nodes after STG is stable.
+Remove the canary resource from kustomization.yaml, delete the canary file, then commit:
 
-Your current state is good: assets now having both AMD64 and ARM64 is exactly the right GitOps pattern. Now validate with a canary before flipping all Sensu agents to Graviton.
+git rm overlays/stg/sensu-agent-arm64-canary.yaml
+git add overlays/stg/kustomization.yaml
+git commit -m "Remove Sensu arm64 canary agent"
+git push
+
+argocd app sync ${ARGO_APP}
+argocd app wait ${ARGO_APP} --sync --health --timeout 600
+
+Remove node label:
+
+kubectl label node ${ARM_NODE} sensu-arm64-canary-
+
+Final check:
+
+kubectl get pods -n ${NS} -o wide
+sensuctl event list
+sensuctl entity list
+
+This gives you one clean path: assets first, backend ARM64, canary agent ARM64, then all agents ARM64.
