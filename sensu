@@ -1,295 +1,169 @@
-Understood. Since EKS is already set and you can only change Sensu namespace manifests, focus only on these two items:
+Public ARM64 YAMLs are provided where available. Ruby-based assets need internal ARM64 builds/placeholders because official Bonsai Ruby plugin assets are AMD64-only. 
 
-1. Sensu backend/agent image
-
-
-2. Sensu runtime assets
-
-
-
-Your uploaded transcript also says the main migration work is validating the Sensu image and runtime assets, especially Ruby-based assets. 
-
+http-check.yaml
 
 ---
-
-1. Sensu image work
-
-Goal
-
-Replace the current AMD64-only Sensu image with an image that supports:
-
-linux/arm64
-
-Command to verify the image
-
-export SENSU_IMAGE="sensu/sensu:<version>"
-
-docker buildx imagetools inspect "$SENSU_IMAGE" | grep -E "linux/(amd64|arm64)"
-
-Expected output must include:
-
-linux/amd64
-linux/arm64
-
-If linux/arm64 is missing, do not use that image.
-
-
----
-
-Update image in Kustomize
-
-Go to your Sensu repo:
-
-cd <sensu-git-repo>
-git checkout STG
-git pull
-
-Find current image:
-
-grep -R "image:" sensu-go/
-
-Update image using Kustomize:
-
-cd <kustomize-overlay-folder>
-
-kustomize edit set image <old-sensu-image>=sensu/sensu:<version>
-
-Example:
-
-kustomize edit set image <private-sensu-image>:latest=sensu/sensu:6.14.0
-
-Verify rendered manifest:
-
-kustomize build . | grep -A2 -B2 "image:"
-
-
----
-
-2. Sensu asset work
-
-Goal
-
-Every Sensu asset used by checks/handlers must have an ARM64 build.
-
-Each asset should have:
-
-url: <arm64-tarball-url>
-sha512: <arm64-sha512>
-filters:
-  - entity.system.os == 'linux'
-  - entity.system.arch == 'arm64'
-
-
----
-
-Go to asset folder
-
-cd <sensu-git-repo>/sensu-go/base/asset
-
-
----
-
-Find assets missing ARM64
-
-grep -L "entity.system.arch == 'arm64'" *.yml *.yaml
-
-Every file shown by this command needs to be fixed.
-
-
----
-
-Find unsafe assets
-
-grep -R "filters: null" .
-
-Any result is risky.
-
-Fix it. Do not leave AMD64 assets with:
-
-filters: null
-
-For AMD64 builds, use:
-
-filters:
-  - entity.system.os == 'linux'
-  - entity.system.arch == 'amd64'
-
-For ARM64 builds, use:
-
-filters:
-  - entity.system.os == 'linux'
-  - entity.system.arch == 'arm64'
-
-
----
-
-Find AMD64-only references
-
-grep -R "linux_amd64\|amd64" .
-
-For each AMD64 asset, add a matching ARM64 build if available.
-
-
----
-
-3. Asset YAML format to use
-
-Each asset should look like this:
-
 type: Asset
 api_version: core/v2
 metadata:
-  name: <asset-name>
+  name: http-check
 spec:
   builds:
-    - url: <asset-linux-amd64.tar.gz>
-      sha512: <amd64-sha512>
+    - url: https://assets.bonsai.sensu.io/c10ac4cba2271b07abc4ce7f99ca3a3074158cfd/http-checks_0.8.0_linux_amd64.tar.gz
+      sha512: e1f7f694b31a338b42e308d28cba19c85128b15e0633cb172847b86de09bdb60bf60912686c00fa04e592794d129e8c8ffa5e9ff8050e940c9a1115a3382c321
       filters:
         - entity.system.os == 'linux'
         - entity.system.arch == 'amd64'
 
-    - url: <asset-linux-arm64.tar.gz>
-      sha512: <arm64-sha512>
+    - url: https://assets.bonsai.sensu.io/c10ac4cba2271b07abc4ce7f99ca3a3074158cfd/http-checks_0.8.0_linux_arm64.tar.gz
+      sha512: aed9d9b15ce21b47ed8ec9f56863e446a798ae8913c6abfddb12e3441873b04371aceaa746415b50c97d8e87fd27dfb99186e23dedfdfddaa8c08097e6a40043
       filters:
         - entity.system.os == 'linux'
         - entity.system.arch == 'arm64'
 
-Keep the same:
+sensu-aggregate-check-asset.yaml
 
+---
+type: Asset
+api_version: core/v2
 metadata:
-  name: <existing-asset-name>
+  name: aggregate-check
+spec:
+  builds:
+    - url: https://assets.bonsai.sensu.io/63cfe3a94f43ed95ee41543f83ab6deba06b1867/sensu-aggregate-check_0.1.4_linux_amd64.tar.gz
+      sha512: 59b9cf27c3e9b520a4290e109bc0d72cad1d861037e0169c891e7b18ebeef4a2109631e3ca42922a52c50457add8bd20063ab47b5110f2aeacc07576ae3dff5a
+      filters:
+        - entity.system.os == 'linux'
+        - entity.system.arch == 'amd64'
 
-Do not rename assets unless absolutely required.
+    - url: https://assets.bonsai.sensu.io/63cfe3a94f43ed95ee41543f83ab6deba06b1867/sensu-aggregate-check_0.1.4_linux_arm64.tar.gz
+      sha512: f313f4d01596f401d3919b2886e4210c9bde15c5a03d6a2c0eccfcbf54928ab2dc916158bc5c39e1e415f5a8c020d0b334b5fd38f907109ccce25a651471c66b
+      filters:
+        - entity.system.os == 'linux'
+        - entity.system.arch == 'arm64'
 
-
----
-
-4. Get SHA512 for ARM64 asset tarball
-
-For each ARM64 asset URL:
-
-export ASSET_URL="<arm64-asset-tarball-url>"
-
-curl -L -o /tmp/asset_arm64.tar.gz "$ASSET_URL"
-
-sha512sum /tmp/asset_arm64.tar.gz
-
-Copy the SHA512 value into the asset YAML.
-
+sensu-aws-sns-handler.yml
 
 ---
+type: Asset
+api_version: core/v2
+metadata:
+  name: aws-sns-handler
+spec:
+  builds:
+    - url: https://assets.bonsai.sensu.io/b3d7751856b5b61b43c83c906df26724d2678ae2/sensu-aws-sns-handler_0.5.0_linux_amd64.tar.gz
+      sha512: 23e85a545c5e5f117dba645def517b0170f3ccd45cbba27fabe2a07a5178f0ee2dd49fda547d8b12cff4bfda62599bc356ded0e39a4a57f11932d56875b69de3
+      filters:
+        - entity.system.os == 'linux'
+        - entity.system.arch == 'amd64'
 
-5. Required assets to check
+    - url: https://assets.bonsai.sensu.io/b3d7751856b5b61b43c83c906df26724d2678ae2/sensu-aws-sns-handler_0.5.0_linux_arm64.tar.gz
+      sha512: a8f91f56dce878932e873a1258f683624145d251a5c6adf53e9198e4a4f1f5c91d3de2ffd5c1b0ae5bb4deb0652e3ab6f8416c96bcde750f8ca135d7c4d8d7bf
+      filters:
+        - entity.system.os == 'linux'
+        - entity.system.arch == 'arm64'
 
-Based on your setup, check these files carefully:
-
-ls -1 | grep -E "http|aggregate|sns|cloudwatch|aws|ruby|plugins"
-
-You need ARM64 support for:
-
-http-check
-aggregate-check
-aws-sns-handler
-cloudwatch-check
-plugins-aws
-plugins-http
-ruby-runtime
-
-Most important one:
-
-sensu-ruby-runtime
-
-If sensu-ruby-runtime is still AMD64-only, Ruby-based checks may fail on ARM64 with:
-
-exec format error
-ruby not found
-no matching asset build
-
+sensu-cloudwatch-check.yaml
 
 ---
+type: Asset
+api_version: core/v2
+metadata:
+  name: cloudwatch-check
+spec:
+  builds:
+    - url: https://assets.bonsai.sensu.io/563862dfe4c714224a4f205f283cb0b6ad73cfd3/sensu-cloudwatch-check_0.3.0_linux_amd64.tar.gz
+      sha512: 2d322a7bd3bd63a71f0352699638d7be6a8531acf526590ade1971d9e21f29663781f6128ad1b1eac5fdcb978c69dfd8830656445d5b64f72823034e26d103ae
+      filters:
+        - entity.system.os == 'linux'
+        - entity.system.arch == 'amd64'
 
-6. Final local validation before push
+    - url: https://assets.bonsai.sensu.io/563862dfe4c714224a4f205f283cb0b6ad73cfd3/sensu-cloudwatch-check_0.3.0_linux_arm64.tar.gz
+      sha512: 52fa93cae5d12d159036426eda40d6b0014de85630e5dc39a1bed00e72dcda677b90abd7d13a2c6e3887913cb228cd3074b0e5dd3bfc8d91dc5721a37360b641
+      filters:
+        - entity.system.os == 'linux'
+        - entity.system.arch == 'arm64'
 
-Run from repo root:
-
-cd <sensu-git-repo>
-
-grep -R "filters: null" sensu-go/base/asset
-
-Expected:
-
-no output
-
-Then:
-
-grep -L "entity.system.arch == 'arm64'" sensu-go/base/asset/*.yml sensu-go/base/asset/*.yaml
-
-Expected:
-
-no output
-
-Then:
-
-grep -L "sha512:" sensu-go/base/asset/*.yml sensu-go/base/asset/*.yaml
-
-Expected:
-
-no output
-
+sensu-go-sql-select-count-check.yml
 
 ---
+type: Asset
+api_version: core/v2
+metadata:
+  name: sensu-go-sql-select-count-check
+spec:
+  builds:
+    - url: https://assets.bonsai.sensu.io/69b36a3bac312c7f619e50a909d94e126cd264e0/sensu-go-sql-select-count-check_0.10.0_linux_amd64.tar.gz
+      sha512: 7e105499cf0ae7863d23516575f6d7b1e1700540a058222d210b1e659423fd89cd5c2b6894eb29b31f54ea28a074be9d967e4fd1d21ceb3699c6342c7c62f66a
+      filters:
+        - entity.system.os == 'linux'
+        - entity.system.arch == 'amd64'
 
-7. Commit asset and image changes
+    - url: https://assets.bonsai.sensu.io/69b36a3bac312c7f619e50a909d94e126cd264e0/sensu-go-sql-select-count-check_0.10.0_linux_arm64.tar.gz
+      sha512: 4989d9bc162198772c52507d7b034b618b9927fb53c14ba93c1c46e83205af826a60f8b813f17b8eea0d9e6385a65ae5f7cce32cefe5db6c2aeb6d26d1e0c1f6
+      filters:
+        - entity.system.os == 'linux'
+        - entity.system.arch == 'arm64'
 
-cd <sensu-git-repo>
-
-git status
-
-git add sensu-go/
-
-git commit -m "Add ARM64 Sensu image and asset support"
-
-git push origin STG
-
-
----
-
-8. After ArgoCD sync, verify inside Sensu
-
-sensuctl asset list --format yaml | grep -E "name:|url:|sha512:|amd64|arm64"
-
-Check events:
-
-sensuctl event list
-
-Check for asset/image errors:
-
-kubectl logs -n <sensu-namespace> sts/<sensu-backend-statefulset> --tail=300 | grep -Ei "error|failed|exec format|no matching asset|sha512|ruby"
-
-kubectl logs -n <sensu-namespace> ds/<sensu-agent-daemonset> --tail=300 | grep -Ei "error|failed|exec format|no matching asset|sha512|ruby"
-
-Good result:
-
-no output
-
+sensu-ruby-runtime.yml
 
 ---
+type: Asset
+api_version: core/v2
+metadata:
+  name: ruby-runtime
+spec:
+  builds:
+    - url: https://assets.bonsai.sensu.io/7fc8223458011cf69710146117fde2523526db68/sensu-ruby-runtime_0.2.1_ruby-2.4.4_debian_linux_amd64.tar.gz
+      sha512: ff3ba13e1a20f89eaac7613fc2c072a8a355918dbaf158b8d1565ebf02d066f3382dde872c1d80002ded762d8a3a860ccce20410b8dedb47b69fd7038e918dde
+      filters:
+        - entity.system.os == 'linux'
+        - entity.system.arch == 'amd64'
 
-Final checklist
+    - url: https://assets.bonsai.sensu.io/ee3290af8de26c91cb8dd7c21935c0de0490cf96/sensu-ruby-runtime_0.2.7_ruby-2.4.4_debian_linux_arm64.tar.gz
+      sha512: e67e0288c0dcc565cc2d101251a73a7a151602490783e9b84676817da5fd05ccabe44057d47949816f4f083d01d5ee98f25f8f4a9fae0f7d77b62e41d04e61b7
+      filters:
+        - entity.system.os == 'linux'
+        - entity.system.arch == 'arm64'
 
-Sensu image:
+sensu-plugins-http.yml
 
-ARM64-supported image selected
-Image updated in Kustomize
-Rendered YAML shows new image
+---
+type: Asset
+api_version: core/v2
+metadata:
+  name: plugins-http
+spec:
+  builds:
+    - url: https://assets.bonsai.sensu.io/30d8361243af8c7806e2d6db4a6dc576dab02966/sensu-plugins-http_5.1.1_debian_linux_amd64.tar.gz
+      sha512: 642643d00c6af177d2e159b9152c0a513c1b193622c1e6dc2735b7518ce57a1522186dcbf62d6cfbdf1c79c45215f1142d362276815c31aa6071d49735bf1d35
+      filters:
+        - entity.system.os == 'linux'
+        - entity.system.arch == 'amd64'
 
-Sensu assets:
+    - url: https://<your-asset-server>/sensu-plugins-http_5.1.1_debian_linux_arm64.tar.gz
+      sha512: <replace-with-arm64-sha512>
+      filters:
+        - entity.system.os == 'linux'
+        - entity.system.arch == 'arm64'
 
-Every asset has ARM64 build
-Every ARM64 build has sha512
-Every AMD64 build has amd64 filter
-Every ARM64 build has arm64 filter
-No filters: null
-Ruby runtime has ARM64 support
+sensu-plugins-aws.yml
 
-Do not move forward if sensu-ruby-runtime is still AMD64-only.
+---
+type: Asset
+api_version: core/v2
+metadata:
+  name: plugins-aws
+spec:
+  builds:
+    - url: https://assets.bonsai.sensu.io/5f04e0fd667ec7b89b5a570c03528a476859b08c/sensu-plugins-aws_18.4.0_debian_linux_amd64.tar.gz
+      sha512: c057951d33aa1d4e952b2f781df452e55ab4b5f39cedc250ae209bc6630858797ffb82fc8e445e7efe50b269ece46a3aa74e45e4c2da6b31d3d8a4dbfdd3012a
+      filters:
+        - entity.system.os == 'linux'
+        - entity.system.arch == 'amd64'
+
+    - url: https://<your-asset-server>/sensu-plugins-aws_18.4.0_debian_linux_arm64.tar.gz
+      sha512: <replace-with-arm64-sha512>
+      filters:
+        - entity.system.os == 'linux'
+        - entity.system.arch == 'arm64'
