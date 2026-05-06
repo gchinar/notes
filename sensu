@@ -1,233 +1,528 @@
-Yes. For production, you need to create/publish the same CloudFront Function in the production account, then associate the production function ARN with the production distribution’s cache behavior.
+Below is a copy/paste runbook. Only edit the first block.
 
-You generally cannot attach the staging account’s function ARN directly to the production account distribution. Copy the function code/config and recreate it in prod.
-
-CloudFront Functions must be published to the LIVE stage before association with a cache behavior. AWS documents that FunctionAssociations require the function to be LIVE. 
+This matches your uploaded Sensu ARM64 migration notes: assets first, then image/scheduling, then ArgoCD sync and validation.  Sensu assets should use url, sha512, and architecture filters such as entity.system.arch == 'arm64'; Kubernetes exposes node architecture with kubernetes.io/arch; and argocd app wait waits for sync/health. 
 
 
 ---
 
-Option A — Console steps
+0. Edit this block only
 
-In production account:
+cat > sensu-arm64-vars.sh <<'EOF'
+export AWS_REGION="<aws-region>"
+export EKS_CLUSTER="<eks-cluster-name>"
 
-1. Go to CloudFront → Functions
+export REPO_DIR="$HOME/<path-to-your-sensu-git-repo>"
+export STG_BRANCH="STG"
 
+export NS="<sensu-namespace>"
+export ARGO_APP="<argocd-sensu-app-name>"
 
-2. Create a new function with the same code as staging
+export BACKEND_STS="sensu-backend"
+export AGENT_DS="sensu-agent"
 
+export ASSET_DIR="sensu-go/base/asset"
+export KUSTOMIZE_OVERLAY="sensu-go/overlays/stg"
 
-3. Test it
+# Current image name as written in Kubernetes YAML, without tag if possible.
+# Example: 123456789.dkr.ecr.ap-south-1.amazonaws.com/sensu
+export CURRENT_SENSU_IMAGE_NAME="<current-sensu-image-name>"
 
+# New ARM64 or multi-arch Sensu image.
+# Example: sensu/sensu:6.14.0
+export SENSU_IMAGE="<new-arm64-or-multiarch-sensu-image>:<tag>"
 
-4. Publish it
+# Leave these as-is if your Graviton nodes use this taint.
+# If your Graviton nodes are not tainted, this toleration is harmless.
+export GRAVITON_TAINT_KEY="graviton"
+export GRAVITON_TAINT_VALUE="true"
+EOF
 
-
-5. Go to CloudFront → Distributions → your prod distribution
-
-
-6. Open the relevant Cache behavior
-
-
-7. Edit → Function associations
-
-
-8. Select:
-
-Event type: usually Viewer request
-
-Function: your new prod CloudFront Function
-
-
-
-9. Save changes
-
-
-
-CloudFront Functions support viewer-side events like viewer-request and viewer-response; origin-side events are for Lambda@Edge, not CloudFront Functions. 
+source sensu-arm64-vars.sh
 
 
 ---
 
-Option B — AWS CLI: copy staging function to prod and associate it
+1. Login to EKS and check tools
 
-Set variables:
+set -euo pipefail
+source sensu-arm64-vars.sh
 
-STG_PROFILE=staging
-PRD_PROFILE=prod
+for cmd in aws kubectl argocd git docker kustomize; do
+  command -v "$cmd" >/dev/null 2>&1 || {
+    echo "STOP: Missing command: $cmd"
+    exit 1
+  }
+done
 
-STG_FUNCTION_NAME="your-staging-function-name"
-PRD_FUNCTION_NAME="your-prod-function-name"
+aws eks update-kubeconfig \
+  --region "$AWS_REGION" \
+  --name "$EKS_CLUSTER"
 
-PROD_DISTRIBUTION_ID="E1234567890ABC"
+kubectl config current-context
 
-# Usually viewer-request, but check staging.
-EVENT_TYPE="viewer-request"
-
-# For default cache behavior, set this empty:
-PATH_PATTERN=""
-
-# For an ordered cache behavior, example:
-# PATH_PATTERN="/api/*"
-
-1. Download staging function code
-
-aws cloudfront get-function \
-  --profile "$STG_PROFILE" \
-  --name "$STG_FUNCTION_NAME" \
-  --stage LIVE \
-  staging-function.js
-
-get-function retrieves the code of a CloudFront Function; config/metadata is retrieved separately with describe-function. 
-
-2. Create the same function in prod
-
-aws cloudfront create-function \
-  --profile "$PRD_PROFILE" \
-  --name "$PRD_FUNCTION_NAME" \
-  --function-config "Comment=Copied from staging,Runtime=cloudfront-js-2.0" \
-  --function-code fileb://staging-function.js
-
-When created, the function starts in DEVELOPMENT; AWS says you must publish it to LIVE before attaching it to a distribution. 
-
-3. Publish the prod function
-
-PROD_FUNCTION_ETAG=$(aws cloudfront describe-function \
-  --profile "$PRD_PROFILE" \
-  --name "$PRD_FUNCTION_NAME" \
-  --query 'ETag' \
-  --output text)
-
-aws cloudfront publish-function \
-  --profile "$PRD_PROFILE" \
-  --name "$PRD_FUNCTION_NAME" \
-  --if-match "$PROD_FUNCTION_ETAG"
-
-Publishing requires the current function ETag, passed as --if-match. 
-
-4. Get the prod function ARN
-
-PROD_FUNCTION_ARN=$(aws cloudfront describe-function \
-  --profile "$PRD_PROFILE" \
-  --name "$PRD_FUNCTION_NAME" \
-  --stage LIVE \
-  --query 'FunctionSummary.FunctionMetadata.FunctionARN' \
-  --output text)
-
-echo "$PROD_FUNCTION_ARN"
-
-5. Download prod distribution config
-
-aws cloudfront get-distribution-config \
-  --profile "$PRD_PROFILE" \
-  --id "$PROD_DISTRIBUTION_ID" \
-  --output json > prod-dist-raw.json
-
-DIST_ETAG=$(jq -r '.ETag' prod-dist-raw.json)
-
-CloudFront distribution updates require the current config plus the distribution ETag as If-Match. 
+argocd app get "$ARGO_APP"
 
 
 ---
 
-6A. Associate function with default cache behavior
+2. Confirm Graviton/ARM64 nodes exist
 
-Use this if staging has the function on the Default cache behavior:
+source sensu-arm64-vars.sh
 
-jq \
-  --arg arn "$PROD_FUNCTION_ARN" \
-  --arg event "$EVENT_TYPE" '
-  def upsert_func_assoc($arn; $event):
-    ((.FunctionAssociations.Items // [])
-      | map(select(.EventType != $event))
-      + [{"EventType": $event, "FunctionARN": $arn}]
-    ) as $items
-    | .FunctionAssociations = {
-        "Quantity": ($items | length),
-        "Items": $items
-      };
+kubectl get nodes -L kubernetes.io/arch
 
-  .DistributionConfig.DefaultCacheBehavior |= upsert_func_assoc($arn; $event)
-  | .DistributionConfig
-' prod-dist-raw.json > prod-dist-updated.json
+ARM64_NODE_COUNT="$(kubectl get nodes -l kubernetes.io/arch=arm64 --no-headers 2>/dev/null | wc -l | tr -d ' ')"
 
-Then update the distribution:
+echo "ARM64 node count: $ARM64_NODE_COUNT"
 
-aws cloudfront update-distribution \
-  --profile "$PRD_PROFILE" \
-  --id "$PROD_DISTRIBUTION_ID" \
-  --if-match "$DIST_ETAG" \
-  --distribution-config file://prod-dist-updated.json
+if [ "$ARM64_NODE_COUNT" -eq 0 ]; then
+  echo "STOP: No ARM64 nodes found. Add Graviton nodes before continuing."
+  exit 1
+fi
+
+kubectl get nodes -l kubernetes.io/arch=arm64 -o wide
 
 
 ---
 
-6B. Associate function with an ordered cache behavior, like /api/*
+3. Checkout STG branch
 
-Use this if staging has the function on a specific cache behavior:
+source sensu-arm64-vars.sh
 
-PATH_PATTERN="/api/*"
+cd "$REPO_DIR"
 
-jq \
-  --arg arn "$PROD_FUNCTION_ARN" \
-  --arg event "$EVENT_TYPE" \
-  --arg path "$PATH_PATTERN" '
-  def upsert_func_assoc($arn; $event):
-    ((.FunctionAssociations.Items // [])
-      | map(select(.EventType != $event))
-      + [{"EventType": $event, "FunctionARN": $arn}]
-    ) as $items
-    | .FunctionAssociations = {
-        "Quantity": ($items | length),
-        "Items": $items
-      };
+git fetch origin
+git checkout "$STG_BRANCH"
+git pull --ff-only origin "$STG_BRANCH"
 
-  .DistributionConfig.CacheBehaviors.Items |=
-    map(
-      if .PathPattern == $path
-      then upsert_func_assoc($arn; $event)
-      else .
-      end
-    )
-  | .DistributionConfig
-' prod-dist-raw.json > prod-dist-updated.json
-
-Then update:
-
-aws cloudfront update-distribution \
-  --profile "$PRD_PROFILE" \
-  --id "$PROD_DISTRIBUTION_ID" \
-  --if-match "$DIST_ETAG" \
-  --distribution-config file://prod-dist-updated.json
+if [ -n "$(git status --porcelain)" ]; then
+  echo "STOP: Git repo has uncommitted changes. Commit/stash them first."
+  git status --short
+  exit 1
+fi
 
 
 ---
 
-Important checks before applying
+4. Backup current live Sensu state
 
-Compare staging vs prod:
+source sensu-arm64-vars.sh
 
-aws cloudfront get-distribution-config \
-  --profile "$STG_PROFILE" \
-  --id "STAGING_DISTRIBUTION_ID" \
-  --query 'DistributionConfig.DefaultCacheBehavior.FunctionAssociations'
+mkdir -p /tmp/sensu-arm64-backup
 
-For ordered behaviors:
+kubectl get sts "$BACKEND_STS" -n "$NS" -o yaml \
+  > /tmp/sensu-arm64-backup/backend-before.yaml
 
-aws cloudfront get-distribution-config \
-  --profile "$STG_PROFILE" \
-  --id "STAGING_DISTRIBUTION_ID" \
-  --query 'DistributionConfig.CacheBehaviors.Items[].{PathPattern:PathPattern,FunctionAssociations:FunctionAssociations}'
+kubectl get ds "$AGENT_DS" -n "$NS" -o yaml \
+  > /tmp/sensu-arm64-backup/agent-before.yaml
 
-Make sure you copy:
+kubectl get pods -n "$NS" -o wide \
+  > /tmp/sensu-arm64-backup/pods-before.txt
 
-Staging setting	Prod should match
+kubectl get nodes -L kubernetes.io/arch \
+  > /tmp/sensu-arm64-backup/nodes-before.txt
 
-Event type	viewer-request or viewer-response
-Cache behavior	Default or specific path like /api/*
-Function code	Same logic, unless prod domain/env differs
-Runtime	Usually cloudfront-js-2.0
-Function publish status	Must be LIVE
+sensuctl asset list --format yaml \
+  > /tmp/sensu-arm64-backup/assets-before.yaml || true
+
+echo "Backup written to /tmp/sensu-arm64-backup"
 
 
-Given your CloudFront issue context, pay close attention to whether the function rewrites paths, redirects, normalizes URLs, or changes headers. A small difference there can make /api/* route differently between staging and production. 
+---
+
+5. Audit Sensu assets
+
+Run this before changing nodes to ARM64.
+
+source sensu-arm64-vars.sh
+
+cd "$REPO_DIR"
+
+echo "Checking asset directory:"
+ls -la "$ASSET_DIR"
+
+echo
+echo "Assets missing ARM64 filter:"
+MISSING_ARM64="$(
+  find "$ASSET_DIR" -type f \( -name "*.yml" -o -name "*.yaml" \) -print0 \
+  | xargs -0 grep -L "entity.system.arch == 'arm64'" || true
+)"
+
+if [ -n "$MISSING_ARM64" ]; then
+  echo "$MISSING_ARM64"
+  echo
+  echo "STOP: Some asset files do not contain ARM64 filters."
+  echo "Fix these files before continuing."
+  exit 1
+else
+  echo "OK: All asset files contain ARM64 filter text."
+fi
+
+echo
+echo "Checking for risky filters: null:"
+BAD_FILTERS="$(grep -R "filters: null" "$ASSET_DIR" || true)"
+
+if [ -n "$BAD_FILTERS" ]; then
+  echo "$BAD_FILTERS"
+  echo
+  echo "STOP: filters: null found. This can make AMD64 assets run on ARM64."
+  echo "Fix these before continuing."
+  exit 1
+else
+  echo "OK: No filters: null found."
+fi
+
+echo
+echo "Checking for missing sha512:"
+NO_SHA="$(
+  find "$ASSET_DIR" -type f \( -name "*.yml" -o -name "*.yaml" \) -print0 \
+  | xargs -0 grep -L "sha512:" || true
+)"
+
+if [ -n "$NO_SHA" ]; then
+  echo "$NO_SHA"
+  echo
+  echo "STOP: Some asset files do not contain sha512."
+  echo "Fix these before continuing."
+  exit 1
+else
+  echo "OK: sha512 found in all asset files."
+fi
+
+echo
+echo "Runtime asset references:"
+grep -R "runtime_assets:" -n sensu-go || true
+
+
+---
+
+6. Generate SHA512 for any missing ARM64 tarball
+
+Only run this when you are adding a new ARM64 asset URL.
+
+export ARM64_ASSET_URL="<paste-arm64-tar-gz-url-here>"
+export ARM64_ASSET_FILE="/tmp/$(basename "$ARM64_ASSET_URL")"
+
+curl -fL "$ARM64_ASSET_URL" -o "$ARM64_ASSET_FILE"
+
+sha512sum "$ARM64_ASSET_FILE"
+
+Copy the checksum output into the asset YAML like this:
+
+sha512: <sha512-value>
+filters:
+  - entity.system.os == 'linux'
+  - entity.system.arch == 'arm64'
+
+Then rerun section 5.
+
+
+---
+
+7. Verify Sensu image supports ARM64
+
+source sensu-arm64-vars.sh
+
+if echo "$SENSU_IMAGE" | grep -q ".dkr.ecr."; then
+  ECR_REGISTRY="$(echo "$SENSU_IMAGE" | cut -d/ -f1)"
+  aws ecr get-login-password --region "$AWS_REGION" \
+    | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+fi
+
+docker buildx imagetools inspect "$SENSU_IMAGE" \
+  > /tmp/sensu-image-manifest.txt
+
+cat /tmp/sensu-image-manifest.txt | grep -E "linux/(amd64|arm64)" || true
+
+grep -q "linux/arm64" /tmp/sensu-image-manifest.txt || {
+  echo "STOP: Sensu image does not show linux/arm64."
+  exit 1
+}
+
+echo "OK: Sensu image supports linux/arm64."
+
+
+---
+
+8. Create ARM64 Kustomize patches
+
+source sensu-arm64-vars.sh
+
+cd "$REPO_DIR/$KUSTOMIZE_OVERLAY"
+
+mkdir -p patches
+
+cat > patches/sensu-backend-arm64.yaml <<EOF
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ${BACKEND_STS}
+spec:
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      tolerations:
+        - key: ${GRAVITON_TAINT_KEY}
+          operator: Equal
+          value: "${GRAVITON_TAINT_VALUE}"
+          effect: NoSchedule
+EOF
+
+cat > patches/sensu-agent-arm64.yaml <<EOF
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ${AGENT_DS}
+spec:
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      tolerations:
+        - key: ${GRAVITON_TAINT_KEY}
+          operator: Equal
+          value: "${GRAVITON_TAINT_VALUE}"
+          effect: NoSchedule
+EOF
+
+kustomize edit add patch --path patches/sensu-backend-arm64.yaml || true
+kustomize edit add patch --path patches/sensu-agent-arm64.yaml || true
+
+kustomize edit set image "${CURRENT_SENSU_IMAGE_NAME}=${SENSU_IMAGE}"
+
+
+---
+
+9. Render manifests locally and confirm ARM64 is present
+
+source sensu-arm64-vars.sh
+
+cd "$REPO_DIR/$KUSTOMIZE_OVERLAY"
+
+kustomize build . > /tmp/sensu-arm64-rendered.yaml
+
+grep -n "kubernetes.io/arch: arm64" /tmp/sensu-arm64-rendered.yaml
+
+grep -n "$SENSU_IMAGE" /tmp/sensu-arm64-rendered.yaml || {
+  echo "STOP: New Sensu image not found in rendered YAML."
+  exit 1
+}
+
+echo "OK: Rendered YAML contains ARM64 scheduling and new image."
+
+
+---
+
+10. Commit and push to STG
+
+source sensu-arm64-vars.sh
+
+cd "$REPO_DIR"
+
+git status --short
+git diff -- "$ASSET_DIR" "$KUSTOMIZE_OVERLAY" || true
+
+git add "$ASSET_DIR" "$KUSTOMIZE_OVERLAY"
+
+git commit -m "Migrate Sensu STG to ARM64 Graviton"
+
+git push origin "$STG_BRANCH"
+
+
+---
+
+11. Sync with ArgoCD
+
+source sensu-arm64-vars.sh
+
+argocd app diff "$ARGO_APP" || true
+
+argocd app sync "$ARGO_APP"
+
+argocd app wait "$ARGO_APP" \
+  --sync \
+  --health \
+  --timeout 600
+
+
+---
+
+12. Wait for Kubernetes rollout
+
+source sensu-arm64-vars.sh
+
+kubectl rollout status sts/"$BACKEND_STS" -n "$NS" --timeout=600s
+
+kubectl rollout status ds/"$AGENT_DS" -n "$NS" --timeout=600s
+
+kubectl get pods -n "$NS" -o wide
+
+
+---
+
+13. Confirm Sensu pods are on ARM64 nodes
+
+source sensu-arm64-vars.sh
+
+kubectl get pods -n "$NS" -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.nodeName}{"\n"}{end}' \
+  | grep -E "${BACKEND_STS}|${AGENT_DS}|sensu" \
+  > /tmp/sensu-pod-nodes.txt || true
+
+cat /tmp/sensu-pod-nodes.txt
+
+echo
+echo "Node architecture for Sensu pods:"
+
+while read -r POD NODE; do
+  ARCH="$(kubectl get node "$NODE" -o jsonpath='{.metadata.labels.kubernetes\.io/arch}')"
+  echo "$POD -> $NODE -> $ARCH"
+done < /tmp/sensu-pod-nodes.txt
+
+Expected output should show:
+
+arm64
+
+
+---
+
+14. Confirm inside containers
+
+source sensu-arm64-vars.sh
+
+for POD in $(kubectl get pods -n "$NS" -o name | grep -E "${BACKEND_STS}|${AGENT_DS}|sensu" | sed 's#pod/##'); do
+  echo "===== $POD ====="
+  kubectl exec -n "$NS" "$POD" -- uname -m || true
+done
+
+Expected output on ARM64 is usually:
+
+aarch64
+
+
+---
+
+15. Verify Sensu assets after sync
+
+sensuctl asset list --format yaml \
+  | grep -E "name:|url:|sha512:|amd64|arm64" || true
+
+
+---
+
+16. Verify Sensu entities and events
+
+sensuctl entity list
+
+sensuctl event list
+
+
+---
+
+17. Check backend logs
+
+source sensu-arm64-vars.sh
+
+kubectl logs -n "$NS" sts/"$BACKEND_STS" --tail=300 \
+  | grep -Ei "error|failed|exec format|no matching asset|sha512|ruby|permission denied" || true
+
+Good result:
+
+no output
+
+
+---
+
+18. Check agent logs
+
+source sensu-arm64-vars.sh
+
+kubectl logs -n "$NS" ds/"$AGENT_DS" --tail=300 \
+  | grep -Ei "error|failed|exec format|no matching asset|sha512|ruby|permission denied" || true
+
+Good result:
+
+no output
+
+
+---
+
+19. Check Kubernetes events
+
+source sensu-arm64-vars.sh
+
+kubectl get events -n "$NS" --sort-by=.lastTimestamp | tail -80
+
+Look for bad signs:
+
+ImagePullBackOff
+CrashLoopBackOff
+FailedScheduling
+exec format error
+
+
+---
+
+20. Final success check
+
+source sensu-arm64-vars.sh
+
+echo "Pods:"
+kubectl get pods -n "$NS" -o wide
+
+echo
+echo "Sensu entities:"
+sensuctl entity list
+
+echo
+echo "Sensu events:"
+sensuctl event list
+
+echo
+echo "Recent backend errors:"
+kubectl logs -n "$NS" sts/"$BACKEND_STS" --tail=200 \
+  | grep -Ei "error|failed|exec format|no matching asset|sha512|ruby|permission denied" || true
+
+echo
+echo "Recent agent errors:"
+kubectl logs -n "$NS" ds/"$AGENT_DS" --tail=200 \
+  | grep -Ei "error|failed|exec format|no matching asset|sha512|ruby|permission denied" || true
+
+Migration is complete only when:
+
+Pods are Running
+Pods are on arm64 nodes
+sensuctl asset list shows arm64 builds
+sensuctl event list looks normal
+No exec format error
+No no matching asset build
+No sha512 mismatch
+No ruby not found
+
+
+---
+
+Rollback command
+
+Run this only if STG fails.
+
+source sensu-arm64-vars.sh
+
+cd "$REPO_DIR"
+
+git revert HEAD --no-edit
+git push origin "$STG_BRANCH"
+
+argocd app sync "$ARGO_APP"
+
+argocd app wait "$ARGO_APP" \
+  --sync \
+  --health \
+  --timeout 600
+
+kubectl rollout status sts/"$BACKEND_STS" -n "$NS" --timeout=600s
+kubectl rollout status ds/"$AGENT_DS" -n "$NS" --timeout=600s
+
+kubectl get pods -n "$NS" -o wide
+
+Do not run this in production until STG passes with clean Sensu events and clean backend/agent logs.
