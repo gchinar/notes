@@ -1,528 +1,295 @@
-Below is a copy/paste runbook. Only edit the first block.
+Understood. Since EKS is already set and you can only change Sensu namespace manifests, focus only on these two items:
 
-This matches your uploaded Sensu ARM64 migration notes: assets first, then image/scheduling, then ArgoCD sync and validation.  Sensu assets should use url, sha512, and architecture filters such as entity.system.arch == 'arm64'; Kubernetes exposes node architecture with kubernetes.io/arch; and argocd app wait waits for sync/health. 
+1. Sensu backend/agent image
 
 
----
+2. Sensu runtime assets
 
-0. Edit this block only
 
-cat > sensu-arm64-vars.sh <<'EOF'
-export AWS_REGION="<aws-region>"
-export EKS_CLUSTER="<eks-cluster-name>"
 
-export REPO_DIR="$HOME/<path-to-your-sensu-git-repo>"
-export STG_BRANCH="STG"
-
-export NS="<sensu-namespace>"
-export ARGO_APP="<argocd-sensu-app-name>"
-
-export BACKEND_STS="sensu-backend"
-export AGENT_DS="sensu-agent"
-
-export ASSET_DIR="sensu-go/base/asset"
-export KUSTOMIZE_OVERLAY="sensu-go/overlays/stg"
-
-# Current image name as written in Kubernetes YAML, without tag if possible.
-# Example: 123456789.dkr.ecr.ap-south-1.amazonaws.com/sensu
-export CURRENT_SENSU_IMAGE_NAME="<current-sensu-image-name>"
-
-# New ARM64 or multi-arch Sensu image.
-# Example: sensu/sensu:6.14.0
-export SENSU_IMAGE="<new-arm64-or-multiarch-sensu-image>:<tag>"
-
-# Leave these as-is if your Graviton nodes use this taint.
-# If your Graviton nodes are not tainted, this toleration is harmless.
-export GRAVITON_TAINT_KEY="graviton"
-export GRAVITON_TAINT_VALUE="true"
-EOF
-
-source sensu-arm64-vars.sh
+Your uploaded transcript also says the main migration work is validating the Sensu image and runtime assets, especially Ruby-based assets. 
 
 
 ---
 
-1. Login to EKS and check tools
+1. Sensu image work
 
-set -euo pipefail
-source sensu-arm64-vars.sh
+Goal
 
-for cmd in aws kubectl argocd git docker kustomize; do
-  command -v "$cmd" >/dev/null 2>&1 || {
-    echo "STOP: Missing command: $cmd"
-    exit 1
-  }
-done
+Replace the current AMD64-only Sensu image with an image that supports:
 
-aws eks update-kubeconfig \
-  --region "$AWS_REGION" \
-  --name "$EKS_CLUSTER"
+linux/arm64
 
-kubectl config current-context
+Command to verify the image
 
-argocd app get "$ARGO_APP"
+export SENSU_IMAGE="sensu/sensu:<version>"
 
+docker buildx imagetools inspect "$SENSU_IMAGE" | grep -E "linux/(amd64|arm64)"
 
----
+Expected output must include:
 
-2. Confirm Graviton/ARM64 nodes exist
+linux/amd64
+linux/arm64
 
-source sensu-arm64-vars.sh
-
-kubectl get nodes -L kubernetes.io/arch
-
-ARM64_NODE_COUNT="$(kubectl get nodes -l kubernetes.io/arch=arm64 --no-headers 2>/dev/null | wc -l | tr -d ' ')"
-
-echo "ARM64 node count: $ARM64_NODE_COUNT"
-
-if [ "$ARM64_NODE_COUNT" -eq 0 ]; then
-  echo "STOP: No ARM64 nodes found. Add Graviton nodes before continuing."
-  exit 1
-fi
-
-kubectl get nodes -l kubernetes.io/arch=arm64 -o wide
+If linux/arm64 is missing, do not use that image.
 
 
 ---
 
-3. Checkout STG branch
+Update image in Kustomize
 
-source sensu-arm64-vars.sh
+Go to your Sensu repo:
 
-cd "$REPO_DIR"
+cd <sensu-git-repo>
+git checkout STG
+git pull
 
-git fetch origin
-git checkout "$STG_BRANCH"
-git pull --ff-only origin "$STG_BRANCH"
+Find current image:
 
-if [ -n "$(git status --porcelain)" ]; then
-  echo "STOP: Git repo has uncommitted changes. Commit/stash them first."
-  git status --short
-  exit 1
-fi
+grep -R "image:" sensu-go/
 
+Update image using Kustomize:
 
----
+cd <kustomize-overlay-folder>
 
-4. Backup current live Sensu state
+kustomize edit set image <old-sensu-image>=sensu/sensu:<version>
 
-source sensu-arm64-vars.sh
+Example:
 
-mkdir -p /tmp/sensu-arm64-backup
+kustomize edit set image <private-sensu-image>:latest=sensu/sensu:6.14.0
 
-kubectl get sts "$BACKEND_STS" -n "$NS" -o yaml \
-  > /tmp/sensu-arm64-backup/backend-before.yaml
+Verify rendered manifest:
 
-kubectl get ds "$AGENT_DS" -n "$NS" -o yaml \
-  > /tmp/sensu-arm64-backup/agent-before.yaml
-
-kubectl get pods -n "$NS" -o wide \
-  > /tmp/sensu-arm64-backup/pods-before.txt
-
-kubectl get nodes -L kubernetes.io/arch \
-  > /tmp/sensu-arm64-backup/nodes-before.txt
-
-sensuctl asset list --format yaml \
-  > /tmp/sensu-arm64-backup/assets-before.yaml || true
-
-echo "Backup written to /tmp/sensu-arm64-backup"
+kustomize build . | grep -A2 -B2 "image:"
 
 
 ---
 
-5. Audit Sensu assets
+2. Sensu asset work
 
-Run this before changing nodes to ARM64.
+Goal
 
-source sensu-arm64-vars.sh
+Every Sensu asset used by checks/handlers must have an ARM64 build.
 
-cd "$REPO_DIR"
+Each asset should have:
 
-echo "Checking asset directory:"
-ls -la "$ASSET_DIR"
-
-echo
-echo "Assets missing ARM64 filter:"
-MISSING_ARM64="$(
-  find "$ASSET_DIR" -type f \( -name "*.yml" -o -name "*.yaml" \) -print0 \
-  | xargs -0 grep -L "entity.system.arch == 'arm64'" || true
-)"
-
-if [ -n "$MISSING_ARM64" ]; then
-  echo "$MISSING_ARM64"
-  echo
-  echo "STOP: Some asset files do not contain ARM64 filters."
-  echo "Fix these files before continuing."
-  exit 1
-else
-  echo "OK: All asset files contain ARM64 filter text."
-fi
-
-echo
-echo "Checking for risky filters: null:"
-BAD_FILTERS="$(grep -R "filters: null" "$ASSET_DIR" || true)"
-
-if [ -n "$BAD_FILTERS" ]; then
-  echo "$BAD_FILTERS"
-  echo
-  echo "STOP: filters: null found. This can make AMD64 assets run on ARM64."
-  echo "Fix these before continuing."
-  exit 1
-else
-  echo "OK: No filters: null found."
-fi
-
-echo
-echo "Checking for missing sha512:"
-NO_SHA="$(
-  find "$ASSET_DIR" -type f \( -name "*.yml" -o -name "*.yaml" \) -print0 \
-  | xargs -0 grep -L "sha512:" || true
-)"
-
-if [ -n "$NO_SHA" ]; then
-  echo "$NO_SHA"
-  echo
-  echo "STOP: Some asset files do not contain sha512."
-  echo "Fix these before continuing."
-  exit 1
-else
-  echo "OK: sha512 found in all asset files."
-fi
-
-echo
-echo "Runtime asset references:"
-grep -R "runtime_assets:" -n sensu-go || true
-
-
----
-
-6. Generate SHA512 for any missing ARM64 tarball
-
-Only run this when you are adding a new ARM64 asset URL.
-
-export ARM64_ASSET_URL="<paste-arm64-tar-gz-url-here>"
-export ARM64_ASSET_FILE="/tmp/$(basename "$ARM64_ASSET_URL")"
-
-curl -fL "$ARM64_ASSET_URL" -o "$ARM64_ASSET_FILE"
-
-sha512sum "$ARM64_ASSET_FILE"
-
-Copy the checksum output into the asset YAML like this:
-
-sha512: <sha512-value>
+url: <arm64-tarball-url>
+sha512: <arm64-sha512>
 filters:
   - entity.system.os == 'linux'
   - entity.system.arch == 'arm64'
 
-Then rerun section 5.
+
+---
+
+Go to asset folder
+
+cd <sensu-git-repo>/sensu-go/base/asset
 
 
 ---
 
-7. Verify Sensu image supports ARM64
+Find assets missing ARM64
 
-source sensu-arm64-vars.sh
+grep -L "entity.system.arch == 'arm64'" *.yml *.yaml
 
-if echo "$SENSU_IMAGE" | grep -q ".dkr.ecr."; then
-  ECR_REGISTRY="$(echo "$SENSU_IMAGE" | cut -d/ -f1)"
-  aws ecr get-login-password --region "$AWS_REGION" \
-    | docker login --username AWS --password-stdin "$ECR_REGISTRY"
-fi
-
-docker buildx imagetools inspect "$SENSU_IMAGE" \
-  > /tmp/sensu-image-manifest.txt
-
-cat /tmp/sensu-image-manifest.txt | grep -E "linux/(amd64|arm64)" || true
-
-grep -q "linux/arm64" /tmp/sensu-image-manifest.txt || {
-  echo "STOP: Sensu image does not show linux/arm64."
-  exit 1
-}
-
-echo "OK: Sensu image supports linux/arm64."
+Every file shown by this command needs to be fixed.
 
 
 ---
 
-8. Create ARM64 Kustomize patches
+Find unsafe assets
 
-source sensu-arm64-vars.sh
+grep -R "filters: null" .
 
-cd "$REPO_DIR/$KUSTOMIZE_OVERLAY"
+Any result is risky.
 
-mkdir -p patches
+Fix it. Do not leave AMD64 assets with:
 
-cat > patches/sensu-backend-arm64.yaml <<EOF
-apiVersion: apps/v1
-kind: StatefulSet
+filters: null
+
+For AMD64 builds, use:
+
+filters:
+  - entity.system.os == 'linux'
+  - entity.system.arch == 'amd64'
+
+For ARM64 builds, use:
+
+filters:
+  - entity.system.os == 'linux'
+  - entity.system.arch == 'arm64'
+
+
+---
+
+Find AMD64-only references
+
+grep -R "linux_amd64\|amd64" .
+
+For each AMD64 asset, add a matching ARM64 build if available.
+
+
+---
+
+3. Asset YAML format to use
+
+Each asset should look like this:
+
+type: Asset
+api_version: core/v2
 metadata:
-  name: ${BACKEND_STS}
+  name: <asset-name>
 spec:
-  template:
-    spec:
-      nodeSelector:
-        kubernetes.io/arch: arm64
-      tolerations:
-        - key: ${GRAVITON_TAINT_KEY}
-          operator: Equal
-          value: "${GRAVITON_TAINT_VALUE}"
-          effect: NoSchedule
-EOF
+  builds:
+    - url: <asset-linux-amd64.tar.gz>
+      sha512: <amd64-sha512>
+      filters:
+        - entity.system.os == 'linux'
+        - entity.system.arch == 'amd64'
 
-cat > patches/sensu-agent-arm64.yaml <<EOF
-apiVersion: apps/v1
-kind: DaemonSet
+    - url: <asset-linux-arm64.tar.gz>
+      sha512: <arm64-sha512>
+      filters:
+        - entity.system.os == 'linux'
+        - entity.system.arch == 'arm64'
+
+Keep the same:
+
 metadata:
-  name: ${AGENT_DS}
-spec:
-  template:
-    spec:
-      nodeSelector:
-        kubernetes.io/arch: arm64
-      tolerations:
-        - key: ${GRAVITON_TAINT_KEY}
-          operator: Equal
-          value: "${GRAVITON_TAINT_VALUE}"
-          effect: NoSchedule
-EOF
+  name: <existing-asset-name>
 
-kustomize edit add patch --path patches/sensu-backend-arm64.yaml || true
-kustomize edit add patch --path patches/sensu-agent-arm64.yaml || true
-
-kustomize edit set image "${CURRENT_SENSU_IMAGE_NAME}=${SENSU_IMAGE}"
+Do not rename assets unless absolutely required.
 
 
 ---
 
-9. Render manifests locally and confirm ARM64 is present
+4. Get SHA512 for ARM64 asset tarball
 
-source sensu-arm64-vars.sh
+For each ARM64 asset URL:
 
-cd "$REPO_DIR/$KUSTOMIZE_OVERLAY"
+export ASSET_URL="<arm64-asset-tarball-url>"
 
-kustomize build . > /tmp/sensu-arm64-rendered.yaml
+curl -L -o /tmp/asset_arm64.tar.gz "$ASSET_URL"
 
-grep -n "kubernetes.io/arch: arm64" /tmp/sensu-arm64-rendered.yaml
+sha512sum /tmp/asset_arm64.tar.gz
 
-grep -n "$SENSU_IMAGE" /tmp/sensu-arm64-rendered.yaml || {
-  echo "STOP: New Sensu image not found in rendered YAML."
-  exit 1
-}
-
-echo "OK: Rendered YAML contains ARM64 scheduling and new image."
+Copy the SHA512 value into the asset YAML.
 
 
 ---
 
-10. Commit and push to STG
+5. Required assets to check
 
-source sensu-arm64-vars.sh
+Based on your setup, check these files carefully:
 
-cd "$REPO_DIR"
+ls -1 | grep -E "http|aggregate|sns|cloudwatch|aws|ruby|plugins"
 
-git status --short
-git diff -- "$ASSET_DIR" "$KUSTOMIZE_OVERLAY" || true
+You need ARM64 support for:
 
-git add "$ASSET_DIR" "$KUSTOMIZE_OVERLAY"
+http-check
+aggregate-check
+aws-sns-handler
+cloudwatch-check
+plugins-aws
+plugins-http
+ruby-runtime
 
-git commit -m "Migrate Sensu STG to ARM64 Graviton"
+Most important one:
 
-git push origin "$STG_BRANCH"
+sensu-ruby-runtime
 
+If sensu-ruby-runtime is still AMD64-only, Ruby-based checks may fail on ARM64 with:
 
----
-
-11. Sync with ArgoCD
-
-source sensu-arm64-vars.sh
-
-argocd app diff "$ARGO_APP" || true
-
-argocd app sync "$ARGO_APP"
-
-argocd app wait "$ARGO_APP" \
-  --sync \
-  --health \
-  --timeout 600
-
-
----
-
-12. Wait for Kubernetes rollout
-
-source sensu-arm64-vars.sh
-
-kubectl rollout status sts/"$BACKEND_STS" -n "$NS" --timeout=600s
-
-kubectl rollout status ds/"$AGENT_DS" -n "$NS" --timeout=600s
-
-kubectl get pods -n "$NS" -o wide
-
-
----
-
-13. Confirm Sensu pods are on ARM64 nodes
-
-source sensu-arm64-vars.sh
-
-kubectl get pods -n "$NS" -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.nodeName}{"\n"}{end}' \
-  | grep -E "${BACKEND_STS}|${AGENT_DS}|sensu" \
-  > /tmp/sensu-pod-nodes.txt || true
-
-cat /tmp/sensu-pod-nodes.txt
-
-echo
-echo "Node architecture for Sensu pods:"
-
-while read -r POD NODE; do
-  ARCH="$(kubectl get node "$NODE" -o jsonpath='{.metadata.labels.kubernetes\.io/arch}')"
-  echo "$POD -> $NODE -> $ARCH"
-done < /tmp/sensu-pod-nodes.txt
-
-Expected output should show:
-
-arm64
-
-
----
-
-14. Confirm inside containers
-
-source sensu-arm64-vars.sh
-
-for POD in $(kubectl get pods -n "$NS" -o name | grep -E "${BACKEND_STS}|${AGENT_DS}|sensu" | sed 's#pod/##'); do
-  echo "===== $POD ====="
-  kubectl exec -n "$NS" "$POD" -- uname -m || true
-done
-
-Expected output on ARM64 is usually:
-
-aarch64
-
-
----
-
-15. Verify Sensu assets after sync
-
-sensuctl asset list --format yaml \
-  | grep -E "name:|url:|sha512:|amd64|arm64" || true
-
-
----
-
-16. Verify Sensu entities and events
-
-sensuctl entity list
-
-sensuctl event list
-
-
----
-
-17. Check backend logs
-
-source sensu-arm64-vars.sh
-
-kubectl logs -n "$NS" sts/"$BACKEND_STS" --tail=300 \
-  | grep -Ei "error|failed|exec format|no matching asset|sha512|ruby|permission denied" || true
-
-Good result:
-
-no output
-
-
----
-
-18. Check agent logs
-
-source sensu-arm64-vars.sh
-
-kubectl logs -n "$NS" ds/"$AGENT_DS" --tail=300 \
-  | grep -Ei "error|failed|exec format|no matching asset|sha512|ruby|permission denied" || true
-
-Good result:
-
-no output
-
-
----
-
-19. Check Kubernetes events
-
-source sensu-arm64-vars.sh
-
-kubectl get events -n "$NS" --sort-by=.lastTimestamp | tail -80
-
-Look for bad signs:
-
-ImagePullBackOff
-CrashLoopBackOff
-FailedScheduling
 exec format error
+ruby not found
+no matching asset build
 
 
 ---
 
-20. Final success check
+6. Final local validation before push
 
-source sensu-arm64-vars.sh
+Run from repo root:
 
-echo "Pods:"
-kubectl get pods -n "$NS" -o wide
+cd <sensu-git-repo>
 
-echo
-echo "Sensu entities:"
-sensuctl entity list
+grep -R "filters: null" sensu-go/base/asset
 
-echo
-echo "Sensu events:"
+Expected:
+
+no output
+
+Then:
+
+grep -L "entity.system.arch == 'arm64'" sensu-go/base/asset/*.yml sensu-go/base/asset/*.yaml
+
+Expected:
+
+no output
+
+Then:
+
+grep -L "sha512:" sensu-go/base/asset/*.yml sensu-go/base/asset/*.yaml
+
+Expected:
+
+no output
+
+
+---
+
+7. Commit asset and image changes
+
+cd <sensu-git-repo>
+
+git status
+
+git add sensu-go/
+
+git commit -m "Add ARM64 Sensu image and asset support"
+
+git push origin STG
+
+
+---
+
+8. After ArgoCD sync, verify inside Sensu
+
+sensuctl asset list --format yaml | grep -E "name:|url:|sha512:|amd64|arm64"
+
+Check events:
+
 sensuctl event list
 
-echo
-echo "Recent backend errors:"
-kubectl logs -n "$NS" sts/"$BACKEND_STS" --tail=200 \
-  | grep -Ei "error|failed|exec format|no matching asset|sha512|ruby|permission denied" || true
+Check for asset/image errors:
 
-echo
-echo "Recent agent errors:"
-kubectl logs -n "$NS" ds/"$AGENT_DS" --tail=200 \
-  | grep -Ei "error|failed|exec format|no matching asset|sha512|ruby|permission denied" || true
+kubectl logs -n <sensu-namespace> sts/<sensu-backend-statefulset> --tail=300 | grep -Ei "error|failed|exec format|no matching asset|sha512|ruby"
 
-Migration is complete only when:
+kubectl logs -n <sensu-namespace> ds/<sensu-agent-daemonset> --tail=300 | grep -Ei "error|failed|exec format|no matching asset|sha512|ruby"
 
-Pods are Running
-Pods are on arm64 nodes
-sensuctl asset list shows arm64 builds
-sensuctl event list looks normal
-No exec format error
-No no matching asset build
-No sha512 mismatch
-No ruby not found
+Good result:
+
+no output
 
 
 ---
 
-Rollback command
+Final checklist
 
-Run this only if STG fails.
+Sensu image:
 
-source sensu-arm64-vars.sh
+ARM64-supported image selected
+Image updated in Kustomize
+Rendered YAML shows new image
 
-cd "$REPO_DIR"
+Sensu assets:
 
-git revert HEAD --no-edit
-git push origin "$STG_BRANCH"
+Every asset has ARM64 build
+Every ARM64 build has sha512
+Every AMD64 build has amd64 filter
+Every ARM64 build has arm64 filter
+No filters: null
+Ruby runtime has ARM64 support
 
-argocd app sync "$ARGO_APP"
-
-argocd app wait "$ARGO_APP" \
-  --sync \
-  --health \
-  --timeout 600
-
-kubectl rollout status sts/"$BACKEND_STS" -n "$NS" --timeout=600s
-kubectl rollout status ds/"$AGENT_DS" -n "$NS" --timeout=600s
-
-kubectl get pods -n "$NS" -o wide
-
-Do not run this in production until STG passes with clean Sensu events and clean backend/agent logs.
+Do not move forward if sensu-ruby-runtime is still AMD64-only.
