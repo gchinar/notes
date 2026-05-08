@@ -1,169 +1,110 @@
-Public ARM64 YAMLs are provided where available. Ruby-based assets need internal ARM64 builds/placeholders because official Bonsai Ruby plugin assets are AMD64-only. 
+My recommendation: do not do a full Sensu Graviton-only migration right now unless this is required to unblock a larger EKS Graviton migration.
 
-http-check.yaml
+For Sensu alone, I would not push this as a cost-saving project.
 
----
-type: Asset
-api_version: core/v2
-metadata:
-  name: http-check
-spec:
-  builds:
-    - url: https://assets.bonsai.sensu.io/c10ac4cba2271b07abc4ce7f99ca3a3074158cfd/http-checks_0.8.0_linux_amd64.tar.gz
-      sha512: e1f7f694b31a338b42e308d28cba19c85128b15e0633cb172847b86de09bdb60bf60912686c00fa04e592794d129e8c8ffa5e9ff8050e940c9a1115a3382c321
-      filters:
-        - entity.system.os == 'linux'
-        - entity.system.arch == 'amd64'
+The reason is simple: the Sensu image is not the hard part. The hard part is your asset chain, especially these Ruby-based assets:
 
-    - url: https://assets.bonsai.sensu.io/c10ac4cba2271b07abc4ce7f99ca3a3074158cfd/http-checks_0.8.0_linux_arm64.tar.gz
-      sha512: aed9d9b15ce21b47ed8ec9f56863e446a798ae8913c6abfddb12e3441873b04371aceaa746415b50c97d8e87fd27dfb99186e23dedfdfddaa8c08097e6a40043
-      filters:
-        - entity.system.os == 'linux'
-        - entity.system.arch == 'arm64'
+sensu-plugins-http
+sensu-plugins-aws
+sensu-plugins-mysql
+sensu-ruby-runtime
 
-sensu-aggregate-check-asset.yaml
+Sensu assets are executed by the backend or agent at runtime, and Sensu asset filters are what decide which architecture-specific tarball is used. Sensu’s docs show assets using sha512, url, and filters like entity.system.arch == 'amd64' or entity.system.arch == 'arm64'.  Your uploaded migration transcript also identifies runtime assets, especially Ruby runtime, as the main complexity. 
 
----
-type: Asset
-api_version: core/v2
-metadata:
-  name: aggregate-check
-spec:
-  builds:
-    - url: https://assets.bonsai.sensu.io/63cfe3a94f43ed95ee41543f83ab6deba06b1867/sensu-aggregate-check_0.1.4_linux_amd64.tar.gz
-      sha512: 59b9cf27c3e9b520a4290e109bc0d72cad1d861037e0169c891e7b18ebeef4a2109631e3ca42922a52c50457add8bd20063ab47b5110f2aeacc07576ae3dff5a
-      filters:
-        - entity.system.os == 'linux'
-        - entity.system.arch == 'amd64'
+The biggest blocker is that your Ruby plugin path is not cleanly ARM64-ready. sensu-plugins-http says it is built against the Sensu Ruby runtime and must include the corresponding Ruby runtime asset in runtime_assets.  sensu-plugins-aws says the same thing and also mentions native gem/build dependency complexity like nokogiri.  sensu-plugins-mysql official Bonsai release assets show amd64 only in the download selector.  The community ARM64 Ruby runtime page I found does not provide ready asset definitions for that version; it points to building the runtime and generating the SHA512 yourself. 
 
-    - url: https://assets.bonsai.sensu.io/63cfe3a94f43ed95ee41543f83ab6deba06b1867/sensu-aggregate-check_0.1.4_linux_arm64.tar.gz
-      sha512: f313f4d01596f401d3919b2886e4210c9bde15c5a03d6a2c0eccfcbf54928ab2dc916158bc5c39e1e415f5a8c020d0b334b5fd38f907109ccce25a651471c66b
-      filters:
-        - entity.system.os == 'linux'
-        - entity.system.arch == 'arm64'
+So the honest decision is:
 
-sensu-aws-sns-handler.yml
+My answer: Do not do full migration now
 
----
-type: Asset
-api_version: core/v2
-metadata:
-  name: aws-sns-handler
-spec:
-  builds:
-    - url: https://assets.bonsai.sensu.io/b3d7751856b5b61b43c83c906df26724d2678ae2/sensu-aws-sns-handler_0.5.0_linux_amd64.tar.gz
-      sha512: 23e85a545c5e5f117dba645def517b0170f3ccd45cbba27fabe2a07a5178f0ee2dd49fda547d8b12cff4bfda62599bc356ded0e39a4a57f11932d56875b69de3
-      filters:
-        - entity.system.os == 'linux'
-        - entity.system.arch == 'amd64'
+Do not move all Sensu agents/backend to ARM64 just by changing image and adding placeholder asset YAMLs.
 
-    - url: https://assets.bonsai.sensu.io/b3d7751856b5b61b43c83c906df26724d2678ae2/sensu-aws-sns-handler_0.5.0_linux_arm64.tar.gz
-      sha512: a8f91f56dce878932e873a1258f683624145d251a5c6adf53e9198e4a4f1f5c91d3de2ffd5c1b0ae5bb4deb0652e3ab6f8416c96bcde750f8ca135d7c4d8d7bf
-      filters:
-        - entity.system.os == 'linux'
-        - entity.system.arch == 'arm64'
+That would be risky because you may get pods running, but checks can still fail with:
 
-sensu-cloudwatch-check.yaml
+exec format error
+no matching asset build
+ruby not found
+sha512 mismatch
+asset download failed
 
----
-type: Asset
-api_version: core/v2
-metadata:
-  name: cloudwatch-check
-spec:
-  builds:
-    - url: https://assets.bonsai.sensu.io/563862dfe4c714224a4f205f283cb0b6ad73cfd3/sensu-cloudwatch-check_0.3.0_linux_amd64.tar.gz
-      sha512: 2d322a7bd3bd63a71f0352699638d7be6a8531acf526590ade1971d9e21f29663781f6128ad1b1eac5fdcb978c69dfd8830656445d5b64f72823034e26d103ae
-      filters:
-        - entity.system.os == 'linux'
-        - entity.system.arch == 'amd64'
+A Running pod only proves the container image works. It does not prove Sensu checks work.
 
-    - url: https://assets.bonsai.sensu.io/563862dfe4c714224a4f205f283cb0b6ad73cfd3/sensu-cloudwatch-check_0.3.0_linux_arm64.tar.gz
-      sha512: 52fa93cae5d12d159036426eda40d6b0014de85630e5dc39a1bed00e72dcda677b90abd7d13a2c6e3887913cb228cd3074b0e5dd3bfc8d91dc5721a37360b641
-      filters:
-        - entity.system.os == 'linux'
-        - entity.system.arch == 'arm64'
+When it is worth doing
 
-sensu-go-sql-select-count-check.yml
+It is worth doing only if one of these is true:
 
----
-type: Asset
-api_version: core/v2
-metadata:
-  name: sensu-go-sql-select-count-check
-spec:
-  builds:
-    - url: https://assets.bonsai.sensu.io/69b36a3bac312c7f619e50a909d94e126cd264e0/sensu-go-sql-select-count-check_0.10.0_linux_amd64.tar.gz
-      sha512: 7e105499cf0ae7863d23516575f6d7b1e1700540a058222d210b1e659423fd89cd5c2b6894eb29b31f54ea28a074be9d967e4fd1d21ceb3699c6342c7c62f66a
-      filters:
-        - entity.system.os == 'linux'
-        - entity.system.arch == 'amd64'
+1. Sensu is blocking a wider EKS Graviton migration.
+2. You can replace Ruby plugins with Go/native ARM64 assets.
+3. You can build and host approved internal ARM64 Ruby assets.
+4. Your team accepts STG testing effort and rollback risk.
 
-    - url: https://assets.bonsai.sensu.io/69b36a3bac312c7f619e50a909d94e126cd264e0/sensu-go-sql-select-count-check_0.10.0_linux_arm64.tar.gz
-      sha512: 4989d9bc162198772c52507d7b034b618b9927fb53c14ba93c1c46e83205af826a60f8b813f17b8eea0d9e6385a65ae5f7cce32cefe5db6c2aeb6d26d1e0c1f6
-      filters:
-        - entity.system.os == 'linux'
-        - entity.system.arch == 'arm64'
+AWS says Graviton instances can cost up to 20% less than comparable x86 EC2 instances, and AWS also provides a Graviton Savings Dashboard to estimate impact.  But for Sensu alone, that saving is usually small unless Sensu consumes dedicated, expensive nodes. The real value comes when many workloads move to Graviton, not just Sensu.
 
-sensu-ruby-runtime.yml
+What I would tell your manager
 
----
-type: Asset
-api_version: core/v2
-metadata:
-  name: ruby-runtime
-spec:
-  builds:
-    - url: https://assets.bonsai.sensu.io/7fc8223458011cf69710146117fde2523526db68/sensu-ruby-runtime_0.2.1_ruby-2.4.4_debian_linux_amd64.tar.gz
-      sha512: ff3ba13e1a20f89eaac7613fc2c072a8a355918dbaf158b8d1565ebf02d066f3382dde872c1d80002ded762d8a3a860ccce20410b8dedb47b69fd7038e918dde
-      filters:
-        - entity.system.os == 'linux'
-        - entity.system.arch == 'amd64'
+Use this:
 
-    - url: https://assets.bonsai.sensu.io/ee3290af8de26c91cb8dd7c21935c0de0490cf96/sensu-ruby-runtime_0.2.7_ruby-2.4.4_debian_linux_arm64.tar.gz
-      sha512: e67e0288c0dcc565cc2d101251a73a7a151602490783e9b84676817da5fd05ccabe44057d47949816f4f083d01d5ee98f25f8f4a9fae0f7d77b62e41d04e61b7
-      filters:
-        - entity.system.os == 'linux'
-        - entity.system.arch == 'arm64'
+> Recommendation: Do not treat Sensu Graviton migration as a simple cost-saving task. The Sensu image can be moved to ARM64, but several runtime assets are Ruby-based and are not cleanly available as official ARM64 assets. The migration is worth doing only if it unblocks broader EKS Graviton adoption. Otherwise, the cost saving from Sensu alone may not justify the engineering and validation effort.
 
-sensu-plugins-http.yml
 
----
-type: Asset
-api_version: core/v2
-metadata:
-  name: plugins-http
-spec:
-  builds:
-    - url: https://assets.bonsai.sensu.io/30d8361243af8c7806e2d6db4a6dc576dab02966/sensu-plugins-http_5.1.1_debian_linux_amd64.tar.gz
-      sha512: 642643d00c6af177d2e159b9152c0a513c1b193622c1e6dc2735b7518ce57a1522186dcbf62d6cfbdf1c79c45215f1142d362276815c31aa6071d49735bf1d35
-      filters:
-        - entity.system.os == 'linux'
-        - entity.system.arch == 'amd64'
 
-    - url: https://<your-asset-server>/sensu-plugins-http_5.1.1_debian_linux_arm64.tar.gz
-      sha512: <replace-with-arm64-sha512>
-      filters:
-        - entity.system.os == 'linux'
-        - entity.system.arch == 'arm64'
+Best practical path
 
-sensu-plugins-aws.yml
+Do this instead of a full migration:
 
----
-type: Asset
-api_version: core/v2
-metadata:
-  name: plugins-aws
-spec:
-  builds:
-    - url: https://assets.bonsai.sensu.io/5f04e0fd667ec7b89b5a570c03528a476859b08c/sensu-plugins-aws_18.4.0_debian_linux_amd64.tar.gz
-      sha512: c057951d33aa1d4e952b2f781df452e55ab4b5f39cedc250ae209bc6630858797ffb82fc8e445e7efe50b269ece46a3aa74e45e4c2da6b31d3d8a4dbfdd3012a
-      filters:
-        - entity.system.os == 'linux'
-        - entity.system.arch == 'amd64'
+Phase 1 — Safe preparation
 
-    - url: https://<your-asset-server>/sensu-plugins-aws_18.4.0_debian_linux_arm64.tar.gz
-      sha512: <replace-with-arm64-sha512>
-      filters:
-        - entity.system.os == 'linux'
-        - entity.system.arch == 'arm64'
+Update only the assets that already have public ARM64 builds:
+
+http-check
+aggregate-check
+aws-sns-handler
+cloudwatch-check
+sensu-go-sql-select-count-check
+
+Also fix all unsafe asset filters:
+
+filters:
+  - entity.system.os == 'linux'
+  - entity.system.arch == 'amd64'
+
+and:
+
+filters:
+  - entity.system.os == 'linux'
+  - entity.system.arch == 'arm64'
+
+Remove all:
+
+filters: null
+
+Phase 2 — Stop and review Ruby
+
+Do not proceed until you have a real solution for:
+
+sensu-ruby-runtime
+sensu-plugins-http
+sensu-plugins-aws
+sensu-plugins-mysql
+
+For these, choose one:
+
+Option A: replace with Go/native Sensu checks
+Option B: build internal ARM64 Ruby assets
+Option C: keep those checks on AMD64
+Option D: drop unused Ruby checks
+
+Since you said you can only change inside the Sensu namespace, Option C may not be possible if the platform team forces only ARM64 nodes. In that case, you must solve Option A or B first.
+
+Final decision
+
+For your current setup:
+
+Sensu image migration: Yes, easy.
+Go/native asset migration: Yes, reasonable.
+Full Sensu Graviton-only migration: Not yet.
+Ruby-based asset migration: Main blocker.
+
+My final recommendation:
+
+> Do not complete the full migration now. Prepare the ARM64-compatible non-Ruby assets first, then pause until Ruby-based checks are replaced or internally rebuilt for ARM64. Only proceed with full Graviton migration if this is part of a broader EKS cost-saving initiative.
