@@ -1,0 +1,97 @@
+Concise Prior Art Differentiation Report — §103
+
+Position
+
+The examiner’s own conclusion supports withdrawal of the §103 objection.
+
+The cited prior arts disclose only this broad concept:
+
+> Displaying additional information within an icon/graphical object area when the icon/object position, size, or location changes.
+
+
+
+That is not the claimed invention.
+
+The examiner expressly identified that the following claimed features are not disclosed:
+
+1. [Applicant to insert missing feature 1];
+
+
+2. [Applicant to insert missing feature 2];
+
+
+3. [Applicant to insert missing feature 3].
+
+
+
+These missing elements are not minor details. They are the core inventive architecture.
+
+
+---
+
+Prior Art 1 — US 10,459,887
+
+Prior Art 1 is directed to predictive application pre-launch. It determines whether an application icon satisfies pre-launch criteria, such as being within a specified display region, and may allow the application/system to decorate the icon with contextual information. 
+
+What it teaches:
+Icon position/size may trigger pre-launch or contextual icon decoration.
+
+What it does not teach:
+It does not teach the above-identified missing claim features.
+
+So Prior Art 1 only reaches:
+
+> “When an icon is in a certain region or size, display additional contextual information.”
+
+
+
+It does not reach:
+
+> “[Applicant to insert claimed technical pipeline].”
+
+
+
+
+---
+
+Prior Art 2 — US 2019/0339860 A1
+
+Prior Art 2 is directed to context-specific user interfaces, including watch graphical objects/complications that move among defined locations and may display different information depending on their location/size. 
+
+What it teaches:
+A watch-face object/complication may change position and display more or less information.
+
+What it does not teach:
+It does not teach the above-identified missing claim features.
+
+So Prior Art 2 only reaches:
+
+> “A complication changes displayed information when moved to another location.”
+
+
+
+It does not reach the claimed technical decision engine.
+
+
+---
+
+Why the examiner’s conclusion defeats §103
+
+A §103 rejection requires an articulated reason why the claimed invention as a whole would have been obvious; the MPEP states that the key to a §103 rejection is a clear articulation of why the claimed invention would have been obvious.
+
+Here, the examiner’s own statement confirms that the cited references lack the claimed core features. The cited arts may show additional information in an icon area, but they do not show or suggest the claimed technical architecture.
+
+Therefore, the cited combination does not provide a prima facie basis for §103 unless the Office supplies a further teaching or reason to add those missing technical layers.
+
+
+---
+
+Proposed concise response language
+
+Applicant respectfully submits that the cited references do not support the §103 rejection.
+
+The Office has correctly observed that Prior Arts 1 and 2 may disclose displaying additional information within an icon or graphical-object area as icon/object position, size, or location changes. However, the Office has also correctly identified that the cited references do not disclose: [Applicant to insert missing claim features].
+
+These missing features are the claimed inventive configuration, not optional implementation details. The cited references merely disclose position/size-based display of additional information. They do not disclose or suggest [Applicant to insert claimed technical architecture].
+
+Accordingly, even if Prior Arts 1 and 2 are combined, the combination would at most yield an icon or complication that displays additional information based on position or size. It would not yield the claimed configuration. Therefore, the cited references do not establish a prima facie case of obviousness, and withdrawal of the §103 rejection is respectfully requested.
