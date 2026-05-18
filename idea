@@ -1,0 +1,17 @@
+#17 — Multi-finger cross-app GenAI creation
+This is the strongest one after the search.
+The best claim angle would be:
+A user simultaneously touches multiple app windows/icons/content objects with different fingers; the system interprets each touch as a semantic input source, builds an intent graph, and uses GenAI to create a new email, itinerary, app, document, image, video, or workflow.
+Example: one finger on TripAdvisor, one on Calendar, one on Email → system generates a vacation leave email or itinerary-sharing message.
+
+Summary
+The invention enables a user to create new AI-generated content or workflows by simultaneously touching multiple applications, app windows, icons, or content elements with different fingers. Each touch identifies a separate contextual source, such as a travel app, calendar app, email app, photo app, or document. The system interprets the combination of touched sources, understands the relationship between them, and uses generative AI to create a new output such as an email, itinerary, document, image, video, application, or automated task.
+For example, if a user touches a travel app with one finger, a calendar app with another finger, and an email app with a third finger, the system may automatically generate a vacation-plan email using trip details, available dates, and the intended communication context.
+Concise Novelty
+The novelty lies in using simultaneous multi-finger touch across different applications or content sources as a contextual input mechanism for generative AI, where each finger-selected source contributes meaning to a combined AI task, resulting in creation of a new application, document, media item, communication, or workflow.
+
+Summary
+The invention enables users to create AI-generated content or workflows on an interactive whiteboard by simultaneously touching multiple apps, widgets, documents, notes, images, or content regions with different fingers or hands. Each touch acts as a contextual input source. The whiteboard system identifies the selected sources, understands their relationship, and uses generative AI to create a new output directly on the board.
+For example, a user may touch a calendar widget, a project note, and an email/contact panel at the same time. The system interprets these selected sources together and generates a meeting agenda, action plan, presentation slide, email draft, diagram, or task list on the whiteboard.
+Concise Novelty
+The novelty lies in using simultaneous multi-finger or multi-touch selection of different whiteboard objects, apps, or content areas as contextual inputs for generative AI, enabling the interactive whiteboard to automatically generate new documents, diagrams, summaries, workflows, media, or collaborative outputs based on the combined meaning of the touched sources
