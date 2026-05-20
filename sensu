@@ -1,110 +1,151 @@
-My recommendation: do not do a full Sensu Graviton-only migration right now unless this is required to unblock a larger EKS Graviton migration.
 
-For Sensu alone, I would not push this as a cost-saving project.
+⸻
 
-The reason is simple: the Sensu image is not the hard part. The hard part is your asset chain, especially these Ruby-based assets:
+1. List running containers
 
-sensu-plugins-http
-sensu-plugins-aws
-sensu-plugins-mysql
-sensu-ruby-runtime
+docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
 
-Sensu assets are executed by the backend or agent at runtime, and Sensu asset filters are what decide which architecture-specific tarball is used. Sensu’s docs show assets using sha512, url, and filters like entity.system.arch == 'amd64' or entity.system.arch == 'arm64'.  Your uploaded migration transcript also identifies runtime assets, especially Ruby runtime, as the main complexity. 
+⸻
 
-The biggest blocker is that your Ruby plugin path is not cleanly ARM64-ready. sensu-plugins-http says it is built against the Sensu Ruby runtime and must include the corresponding Ruby runtime asset in runtime_assets.  sensu-plugins-aws says the same thing and also mentions native gem/build dependency complexity like nokogiri.  sensu-plugins-mysql official Bonsai release assets show amd64 only in the download selector.  The community ARM64 Ruby runtime page I found does not provide ready asset definitions for that version; it points to building the runtime and generating the SHA512 yourself. 
+2. Find Docker Compose working directory
 
-So the honest decision is:
+docker inspect <FRONTEND_CONTAINER> \
+  --format='WorkingDir={{index .Config.Labels "com.docker.compose.project.working_dir"}}
+ComposeFile={{index .Config.Labels "com.docker.compose.project.config_files"}}
+Project={{index .Config.Labels "com.docker.compose.project"}}'
 
-My answer: Do not do full migration now
+⸻
 
-Do not move all Sensu agents/backend to ARM64 just by changing image and adding placeholder asset YAMLs.
+3. Go to compose directory
 
-That would be risky because you may get pods running, but checks can still fail with:
+cd <COMPOSE_WORKING_DIRECTORY>
+pwd
+ls -la
 
-exec format error
-no matching asset build
-ruby not found
-sha512 mismatch
-asset download failed
+⸻
 
-A Running pod only proves the container image works. It does not prove Sensu checks work.
+4. Find compose files
 
-When it is worth doing
+find . -maxdepth 2 -type f \( \
+  -name '*compose*.yml' -o \
+  -name '*compose*.yaml' -o \
+  -name 'docker-compose.yml' -o \
+  -name 'docker-compose.yaml' \
+\) -print
 
-It is worth doing only if one of these is true:
+⸻
 
-1. Sensu is blocking a wider EKS Graviton migration.
-2. You can replace Ruby plugins with Go/native ARM64 assets.
-3. You can build and host approved internal ARM64 Ruby assets.
-4. Your team accepts STG testing effort and rollback risk.
+5. View compose file
 
-AWS says Graviton instances can cost up to 20% less than comparable x86 EC2 instances, and AWS also provides a Graviton Savings Dashboard to estimate impact.  But for Sensu alone, that saving is usually small unless Sensu consumes dedicated, expensive nodes. The real value comes when many workloads move to Graviton, not just Sensu.
+cat <COMPOSE_FILE_NAME>
 
-What I would tell your manager
+Before sharing the output, replace sensitive values like this:
 
-Use this:
+<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/<REPOSITORY>:<TAG>
+<INTERNAL_DOMAIN>
+<PRIVATE_IP>
+<SECRET_VALUE>
+<DB_URL>
 
-> Recommendation: Do not treat Sensu Graviton migration as a simple cost-saving task. The Sensu image can be moved to ARM64, but several runtime assets are Ruby-based and are not cleanly available as official ARM64 assets. The migration is worth doing only if it unblocks broader EKS Graviton adoption. Otherwise, the cost saving from Sensu alone may not justify the engineering and validation effort.
+⸻
 
+6. Inspect image, command, ports for all containers
 
+for c in <NGINX_CONTAINER> <FRONTEND_CONTAINER> <BACKEND_CONTAINER>; do
+  echo "===== $c ====="
+  docker inspect "$c" \
+    --format='Image={{.Config.Image}}
+Entrypoint={{json .Config.Entrypoint}}
+Cmd={{json .Config.Cmd}}
+WorkingDir={{.Config.WorkingDir}}
+RestartPolicy={{json .HostConfig.RestartPolicy}}
+ExposedPorts={{json .Config.ExposedPorts}}
+PortBindings={{json .HostConfig.PortBindings}}'
+  echo
+done
 
-Best practical path
+⸻
 
-Do this instead of a full migration:
+7. Check environment variables with secrets masked
 
-Phase 1 — Safe preparation
+for c in <NGINX_CONTAINER> <FRONTEND_CONTAINER> <BACKEND_CONTAINER>; do
+  echo "===== $c ENV ====="
+  docker inspect "$c" \
+    --format='{{range .Config.Env}}{{println .}}{{end}}' \
+    | sort \
+    | sed -E 's/(PASSWORD|PASS|SECRET|TOKEN|KEY|CREDENTIAL|ACCESS_KEY|PRIVATE_KEY|DB_URL|DATABASE_URL|USERNAME|USER)=.*/\1=***MASKED***/I'
+  echo
+done
 
-Update only the assets that already have public ARM64 builds:
+⸻
 
-http-check
-aggregate-check
-aws-sns-handler
-cloudwatch-check
-sensu-go-sql-select-count-check
+8. Check nginx routing config
 
-Also fix all unsafe asset filters:
+docker exec <NGINX_CONTAINER> nginx -T 2>/dev/null \
+  | grep -nE "server_name|listen|location|proxy_pass|upstream|root|try_files" -A5 -B5
 
-filters:
-  - entity.system.os == 'linux'
-  - entity.system.arch == 'amd64'
+⸻
 
-and:
+9. Check full nginx config
 
-filters:
-  - entity.system.os == 'linux'
-  - entity.system.arch == 'arm64'
+Only share this after redacting internal domains, IPs, and paths if needed.
 
-Remove all:
+docker exec <NGINX_CONTAINER> nginx -T 2>/dev/null
 
-filters: null
+⸻
 
-Phase 2 — Stop and review Ruby
+10. Check frontend runtime
 
-Do not proceed until you have a real solution for:
+docker exec <FRONTEND_CONTAINER> sh -lc '
+pwd
+ps -ef
+ls -la
+cat package.json 2>/dev/null || true
+'
 
-sensu-ruby-runtime
-sensu-plugins-http
-sensu-plugins-aws
-sensu-plugins-mysql
+⸻
 
-For these, choose one:
+11. Check backend runtime
 
-Option A: replace with Go/native Sensu checks
-Option B: build internal ARM64 Ruby assets
-Option C: keep those checks on AMD64
-Option D: drop unused Ruby checks
+docker exec <BACKEND_CONTAINER> sh -lc '
+pwd
+ps -ef
+ls -la
+'
 
-Since you said you can only change inside the Sensu namespace, Option C may not be possible if the platform team forces only ARM64 nodes. In that case, you must solve Option A or B first.
+⸻
 
-Final decision
+12. Test nginx to frontend connectivity
 
-For your current setup:
+docker exec <NGINX_CONTAINER> sh -lc \
+'wget -S -O- http://<FRONTEND_CONTAINER>:3000 2>&1 | head -40 || true'
 
-Sensu image migration: Yes, easy.
-Go/native asset migration: Yes, reasonable.
-Full Sensu Graviton-only migration: Not yet.
-Ruby-based asset migration: Main blocker.
+⸻
 
-My final recommendation:
+13. Test nginx to backend connectivity
 
-> Do not complete the full migration now. Prepare the ARM64-compatible non-Ruby assets first, then pause until Ruby-based checks are replaced or internally rebuilt for ARM64. Only proceed with full Graviton migration if this is part of a broader EKS cost-saving initiative.
+docker exec <NGINX_CONTAINER> sh -lc \
+'wget -S -O- http://<BACKEND_CONTAINER>:8080 2>&1 | head -40 || true'
+
+If backend uses a different port, replace 8080.
+
+⸻
+
+14. Check logs
+
+docker logs --tail=100 <NGINX_CONTAINER>
+docker logs --tail=100 <FRONTEND_CONTAINER>
+docker logs --tail=100 <BACKEND_CONTAINER>
+
+⸻
+
+15. Check Docker networks
+
+docker network ls
+docker inspect <NGINX_CONTAINER> \
+  --format='{{json .NetworkSettings.Networks}}'
+docker inspect <FRONTEND_CONTAINER> \
+  --format='{{json .NetworkSettings.Networks}}'
+docker inspect <BACKEND_CONTAINER> \
+  --format='{{json .NetworkSettings.Networks}}'
+
