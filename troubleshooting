@@ -1,0 +1,48 @@
+Let me pull the exact image references from your bundle so my fix matches what you actually have, then confirm the current state of those registries.
+
+I can see exactly what's happening. Let me confirm the current registry state before giving you the fix.
+
+That error is expected — those images no longer exist at that path. Here's what happened and the fix for your setup.
+
+## Why it's failing
+
+Broadcom deleted the public `docker.io/bitnami/*` catalog on **September 29, 2025**. All existing container [Chkk](https://www.chkk.io/blog/bitnami-deprecation) images, including versioned tags like postgresql:13.7.0, were moved to the legacy repository, and the old public catalog was deleted. So `bitnami/postgresql:16` and `bitnami/clickhouse:latest` resolve to nothing. (`:latest` also was never a valid Bitnami tag — they only ever published versioned tags.) The frozen copies now live at `docker.io/bitnamilegacy/*`.
+
+## The fix: don't mirror Bitnami at all
+
+This is exactly why we set every datastore subchart to `deploy: false` in your design. The chart isn't supposed to pull Postgres/ClickHouse — **your own manifests run them, using official multi-arch images** (the Bitnami legacy images aren't reliably arm64, which was the whole reason to avoid them). Mirror these instead:
+
+| You tried (gone) | Mirror this instead | Multi-arch? |
+|---|---|---|
+| `bitnami/postgresql:16` | `postgres:16` (Docker official) | ✅ arm64 |
+| `bitnami/clickhouse:latest` | `clickhouse/clickhouse-server:25.8` | ✅ arm64 |
+| `bitnami/valkey` | `valkey/valkey:8` | ✅ arm64 |
+| *(minio)* | **not needed** — you use real S3 via IRSA | — |
+| *(zookeeper)* | **not needed** — single-node ClickHouse (`clusterEnabled:false`) | — |
+
+Plus `qdrant/qdrant` and the app images `langfuse/langfuse` + `langfuse/langfuse-worker`. Pin each to a current patch tag rather than `latest`.
+
+## Mirror so arm64 is preserved
+
+Critical: a plain `docker pull` on an amd64 machine grabs **only the amd64 layer** — push that to ECR and your pods CrashLoop on Graviton with `exec format error`. Use a manifest-list-aware copy (`crane` or `skopeo`), which copies all architectures:
+
+```bash
+aws ecr get-login-password --region <region> \
+  | docker login --username AWS --password-stdin <acct>.dkr.ecr.<region>.amazonaws.com
+ECR=<acct>.dkr.ecr.<region>.amazonaws.com
+
+crane copy docker.io/library/postgres:16        $ECR/postgres:16
+crane copy clickhouse/clickhouse-server:25.8     $ECR/clickhouse-server:25.8
+crane copy valkey/valkey:8                        $ECR/valkey:8
+crane copy qdrant/qdrant:<pin>                    $ECR/qdrant:<pin>
+crane copy langfuse/langfuse:3                     $ECR/langfuse:3
+crane copy langfuse/langfuse-worker:3            $ECR/langfuse-worker:3
+```
+
+`skopeo copy --all docker://… docker://…` works the same way. (If you must use `docker pull`, add `--platform linux/arm64`.)
+
+Then point the `image:` fields in `apps/langfuse/base/{postgres,clickhouse,valkey}.yaml`, `apps/qdrant/base/statefulset.yaml`, and the `langfuse.web/worker.image.repository` in `values-stg.yaml` at your `$ECR/...` paths.
+
+One thing worth checking: if the Helm release itself is trying to pull `bitnami/postgresql`, then a subchart `deploy:` flag flipped back to `true` somewhere — those should all be `false`. If you did intend to let the chart manage the databases, the only valid source now is `bitnamilegacy/*` with `global.security.allowInsecureImages: true`, but I'd steer you away from that on Graviton since those frozen images aren't guaranteed arm64.
+
+Want me to update the bundle's manifests and `values-stg.yaml` with the ECR image paths filled in so you can drop them straight in?
