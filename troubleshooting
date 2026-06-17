@@ -1,16 +1,13 @@
-Setting `deploy: false` only tells the chart to skip the *bundled* instances — you now have to point Langfuse at external ones, or it has nowhere to store data. So the main remaining task is filling in the connection details in each of those same sections.
+No. Changing an image reference can't create duplicate env vars — the image repository/tag and the container's `env` list are separate fields in the pod spec. Swapping `docker.io/...` for your ECR URI only changes where the image is pulled from; it adds nothing to the environment. So if you edit only the image fields, that really is all that changes — env, config, and secrets stay exactly as they are.
 
-**Postgres** — host, port, database, username, password. The database itself usually needs to exist already; Langfuse runs migrations to create its tables but won't always create the DB.
+Duplicate env var names come from a different thing entirely: setting the same variable in two places. The usual cause is putting something in `additionalEnv` that the chart already generates from its structured values — e.g., hand-writing a `DATABASE_URL` while `postgres.host`/`auth` are also filled in, so the chart emits its own copy. That's unrelated to the registry switch, and since the ECR work doesn't need any `additionalEnv`, it introduces no new duplicate risk at all.
 
-**ClickHouse** — host, native port (9000), HTTP port (8123), username, password, database. Two things that bite people:
-- Set `clustered: false` if it's a single node, otherwise migrations run `ON CLUSTER` and fail.
-- The migration connection uses the native TCP port (9000), separate from the HTTP port (8123) — make sure both are reachable.
+If a duplicate ever does slip in, Kubernetes won't error — it allows it, and the last entry in the list wins — but it's worth avoiding, since which value actually applies isn't obvious.
 
-**Redis/Valkey** — host, port, password, and a TLS flag if your provider needs it. Important: Langfuse uses Redis as a job queue and requires `maxmemory-policy noeviction`. Managed Redis like ElastiCache often defaults to an eviction policy, which silently breaks queue processing.
+To confirm before applying, render the chart and scan the env block:
 
-Then the cross-cutting pieces:
-- Network — your pods actually have to reach these endpoints (security groups / VPC / firewall rules).
-- Secrets — prefer the chart's `existingSecret` option over plaintext passwords in values.yaml where it's supported.
-- Blob storage — note that disabling those three still leaves MinIO (S3-compatible storage) deploying by default. If you also want external S3, that's a separate section.
+```bash
+helm template langfuse langfuse/langfuse -f values.yaml > rendered.yaml
+```
 
-Exact key names drift between chart versions, so cross-check the comments in the chart's own values.yaml. Want me to sketch the filled-in YAML for one of these as a starting point?
+Open the web/worker deployment's `env:` section — the chart's own vars plus anything in your `additionalEnv` are the only sources, so any repeated `- name:` is something set twice.
