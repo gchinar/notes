@@ -1,17 +1,52 @@
-Keep **`deploy: false`** — for all four (postgresql, clickhouse, redis, s3). That's correct for your setup, and flipping any to `true` brings back the exact problem you've been fighting.
+Yes — you can keep a single ArgoCD application. The trick is to make that one application **multi-source**: one source renders your datastore manifests, another pulls the Helm chart, and a third provides the values file. ArgoCD reconciles all of them under one Application with one sync and one health view.
 
-Here's the distinction that matters, because `deploy: false` is easy to misread:
+Your current Langfuse app is already a Helm source (plus the `$values` ref). You just **add a third source** for the Postgres/ClickHouse/Valkey manifests and drop the idea of a separate infra app:
 
-**`deploy: false` does *not* mean "no database."** It means *the Langfuse Helm chart* won't deploy one — you're providing your own. Your Postgres, ClickHouse, and Valkey still run, from your own manifests in `apps/langfuse/base/*.yaml` using the official **arm64** images you mirrored to ECR. Langfuse just connects to them via the `host` / `auth` values in the file. The database is there; the chart simply doesn't manage it.
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: langfuse-stg
+  namespace: argocd
+spec:
+  project: default
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: aidata
+  sources:
+    # 1) your in-cluster datastores (Postgres + ClickHouse + Valkey)
+    - repoURL: https://git.example.com/infra/gitops.git
+      targetRevision: STG
+      path: apps/langfuse/overlays/stg
 
-**`deploy: true`** means the chart deploys the datastores itself, via the bundled **Bitnami subcharts**. On your cluster that's a triple problem:
+    # 2) the Langfuse Helm chart, fed the values file from source #3
+    - repoURL: https://langfuse.github.io/langfuse-k8s
+      chart: langfuse
+      targetRevision: 1.5.34
+      helm:
+        valueFiles:
+          - $values/apps/langfuse/values/values-stg.yaml
 
-- The subcharts pull `bitnamilegacy/*` images — frozen, unsupported, and **not reliably arm64** (this is the source of your "not found" / arch pain).
-- They pull from Docker Hub, **not your ECR**, so they'd bypass your mirroring entirely.
-- You'd have to set `global.security.allowInsecureImages: true` and accept images that get no patches.
+    # 3) value-file provider (ref only — renders nothing on its own)
+    - repoURL: https://git.example.com/infra/gitops.git
+      targetRevision: STG
+      ref: values
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions: [CreateNamespace=true]
+```
 
-So `true` undoes the whole reason the bundle exists. `false` everywhere is right.
+To get apply-ordering inside the single app, add a sync-wave annotation to your three datastore manifests so they go first:
 
-When would `true` be the sensible choice? Only if you were on x86 nodes, fine with the frozen Bitnami images, and *not* mirroring to a private registry — i.e., the quick-and-dirty path. None of that is your situation.
+```yaml
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"   # datastores before the chart (wave 0)
+```
 
-One thing to confirm since you're on `deploy: false`: the three in-cluster datastore manifests must actually be synced **before** the Langfuse release — in the bundle that's the `langfuse-infra-stg` ArgoCD app at sync-wave 0, with the Helm release at wave 1. If those Services (`postgres.aidata`, `clickhouse.aidata`, `valkey.aidata`) aren't up, Langfuse will start and fail to connect. As long as that ordering holds, `deploy: false` is exactly what you want.
+A few things to know:
+- **Needs ArgoCD ≥ 2.6** — that's when multiple `sources` and the `$values` ref pattern landed. On older versions you'd have to split into two apps.
+- **Ordering isn't strict, and that's okay.** ArgoCD/Helm won't block until the databases are *ready*; the sync-wave just controls apply order. If langfuse-web/worker start before the DB is reachable, they crashloop-retry and recover once it's up (`selfHeal` helps). The wave annotation just makes it tidy.
+- This **replaces** both your current app and the would-be infra app — you end with exactly **one** Application, just multi-source.
+
+If you'd rather not touch the Application at all, the alternative is inlining the datastore manifests into the chart's `extraManifests: []` value — also one app, but you'd be pasting full StatefulSets into your values file, which is messier than keeping them as their own source. I'd go with the multi-source approach above.
