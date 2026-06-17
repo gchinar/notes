@@ -1,32 +1,17 @@
-Let me confirm the exact value key from the chart before I tell you what to change.
+Keep **`deploy: false`** — for all four (postgresql, clickhouse, redis, s3). That's correct for your setup, and flipping any to `true` brings back the exact problem you've been fighting.
 
-Yes — that's exactly the cause, and it's a rough edge in how the bundle set it. Here's the mechanism:
+Here's the distinction that matters, because `deploy: false` is easy to misread:
 
-The Langfuse chart **always emits its own `NEXTAUTH_URL`**, rendered from the native value `langfuse.nextauth.url` (which defaults to `http://localhost:3000` if you don't set it). The bundle additionally injected `NEXTAUTH_URL` through `langfuse.additionalEnv`. So the rendered container ends up with **two `env` entries named `NEXTAUTH_URL`** — one from the chart, one from your `additionalEnv`. Kubernetes env lists use `name` as the strategic‑merge key and it must be unique, so the Kustomize/ArgoCD patch fails on the duplicate.
+**`deploy: false` does *not* mean "no database."** It means *the Langfuse Helm chart* won't deploy one — you're providing your own. Your Postgres, ClickHouse, and Valkey still run, from your own manifests in `apps/langfuse/base/*.yaml` using the official **arm64** images you mirrored to ECR. Langfuse just connects to them via the `host` / `auth` values in the file. The database is there; the chart simply doesn't manage it.
 
-**Fix: stop setting it via `additionalEnv`; set it through the chart's own field instead.** In `apps/langfuse/values/values-stg.yaml`:
+**`deploy: true`** means the chart deploys the datastores itself, via the bundled **Bitnami subcharts**. On your cluster that's a triple problem:
 
-Remove this:
-```yaml
-langfuse:
-  additionalEnv:
-    - name: NEXTAUTH_URL          # ← delete this entry
-      value: "https://langfuse-stg.<domain>"
-```
+- The subcharts pull `bitnamilegacy/*` images — frozen, unsupported, and **not reliably arm64** (this is the source of your "not found" / arch pain).
+- They pull from Docker Hub, **not your ECR**, so they'd bypass your mirroring entirely.
+- You'd have to set `global.security.allowInsecureImages: true` and accept images that get no patches.
 
-And set it natively (alongside the nextauth secret you already have):
-```yaml
-langfuse:
-  nextauth:
-    url: "https://langfuse-stg.<domain>"   # exact ingress host, https, no trailing slash
-    secret:
-      secretKeyRef:
-        name: langfuse-poc-secrets
-        key: nextauth-secret
-```
+So `true` undoes the whole reason the bundle exists. `false` everywhere is right.
 
-Now the chart renders a single `NEXTAUTH_URL` and the patch applies cleanly. (If `additionalEnv` becomes empty after removing it, just set `additionalEnv: []` or drop the key.)
+When would `true` be the sensible choice? Only if you were on x86 nodes, fine with the frozen Bitnami images, and *not* mirroring to a private registry — i.e., the quick-and-dirty path. None of that is your situation.
 
-**The general rule that avoids this everywhere:** `additionalEnv` is only for variables the chart *doesn't* already manage. The chart generates `NEXTAUTH_URL`, `NEXTAUTH_SECRET`, `SALT`, `ENCRYPTION_KEY`, `DATABASE_URL`, the `CLICKHOUSE_*`, `REDIS_*`, and `LANGFUSE_S3_*` vars from its native value keys. Duplicating any of those in `additionalEnv` produces the same duplicate‑key patch error — so configure each through its native value, and reserve `additionalEnv` for genuinely extra settings.
-
-Want me to correct `values-stg.yaml` in the bundle (move `NEXTAUTH_URL` to `nextauth.url`) and hand it back ready to drop in?
+One thing to confirm since you're on `deploy: false`: the three in-cluster datastore manifests must actually be synced **before** the Langfuse release — in the bundle that's the `langfuse-infra-stg` ArgoCD app at sync-wave 0, with the Helm release at wave 1. If those Services (`postgres.aidata`, `clickhouse.aidata`, `valkey.aidata`) aren't up, Langfuse will start and fail to connect. As long as that ordering holds, `deploy: false` is exactly what you want.
