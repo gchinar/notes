@@ -1,52 +1,46 @@
-Yes — you can keep a single ArgoCD application. The trick is to make that one application **multi-source**: one source renders your datastore manifests, another pulls the Helm chart, and a third provides the values file. ArgoCD reconciles all of them under one Application with one sync and one health view.
+Let me check exactly how the chart wires that env var so I give you the precise fix.
 
-Your current Langfuse app is already a Helm source (plus the `$values` ref). You just **add a third source** for the Postgres/ClickHouse/Valkey manifests and drop the idea of a separate infra app:
+Found it — I read the chart template, and this is a values gap, not a bug.
 
-```yaml
-apiVersion: argoproj.io/v1alpha1
-kind: Application
-metadata:
-  name: langfuse-stg
-  namespace: argocd
-spec:
-  project: default
-  destination:
-    server: https://kubernetes.default.svc
-    namespace: aidata
-  sources:
-    # 1) your in-cluster datastores (Postgres + ClickHouse + Valkey)
-    - repoURL: https://git.example.com/infra/gitops.git
-      targetRevision: STG
-      path: apps/langfuse/overlays/stg
+The chart builds that env var like this:
 
-    # 2) the Langfuse Helm chart, fed the values file from source #3
-    - repoURL: https://langfuse.github.io/langfuse-k8s
-      chart: langfuse
-      targetRevision: 1.5.34
-      helm:
-        valueFiles:
-          - $values/apps/langfuse/values/values-stg.yaml
-
-    # 3) value-file provider (ref only — renders nothing on its own)
-    - repoURL: https://git.example.com/infra/gitops.git
-      targetRevision: STG
-      ref: values
-  syncPolicy:
-    automated: { prune: true, selfHeal: true }
-    syncOptions: [CreateNamespace=true]
+```
+- name: CLICKHOUSE_MIGRATION_URL
+  {{- if .Values.clickhouse.migration.url }}     # ← uses this if set
+  {{- else if .Values.clickhouse.host }}          # ← else derives clickhouse://<host>:9000
+  {{- else if .Values.clickhouse.deploy }}        # ← else (deploy:true) auto-derives
 ```
 
-To get apply-ordering inside the single app, add a sync-wave annotation to your three datastore manifests so they go first:
+With `clickhouse.deploy: false`, the var is **only emitted if `clickhouse.migration.url` or `clickhouse.host` is set**. If both are blank, the chart skips it entirely and langfuse-web starts with no `CLICKHOUSE_MIGRATION_URL` → exactly your error. So your running values almost certainly have those two fields empty.
+
+**Fix — set the host and the migration URL** (this is what's in the file I shared):
 
 ```yaml
-metadata:
-  annotations:
-    argocd.argoproj.io/sync-wave: "-1"   # datastores before the chart (wave 0)
+clickhouse:
+  deploy: false
+  host: "clickhouse.aidata.svc.cluster.local"
+  httpPort: 8123
+  nativePort: 9000
+  database: default
+  clusterEnabled: false
+  auth:
+    username: default
+    existingSecret: langfuse-poc-secrets
+    existingSecretKey: clickhouse-password
+  migration:
+    url: "clickhouse://clickhouse.aidata.svc.cluster.local:9000"
+    autoMigrate: true
 ```
 
-A few things to know:
-- **Needs ArgoCD ≥ 2.6** — that's when multiple `sources` and the `$values` ref pattern landed. On older versions you'd have to split into two apps.
-- **Ordering isn't strict, and that's okay.** ArgoCD/Helm won't block until the databases are *ready*; the sync-wave just controls apply order. If langfuse-web/worker start before the DB is reachable, they crashloop-retry and recover once it's up (`selfHeal` helps). The wave annotation just makes it tidy.
-- This **replaces** both your current app and the would-be infra app — you end with exactly **one** Application, just multi-source.
+Two things that trip people up here:
+- **It must be the `clickhouse://` scheme on the native port `9000`**, not the HTTP `8123` endpoint. `CLICKHOUSE_URL` (HTTP/8123) and `CLICKHOUSE_MIGRATION_URL` (native/9000) are two different vars; the chart derives the HTTP one from `host` + `httpPort` and the migration one from `migration.url`.
+- **Do not put any `CLICKHOUSE_*` var in `additionalEnv`.** The very top of that template says: if `CLICKHOUSE_MIGRATION_URL` is found in `additionalEnv`, the chart does *nothing* for ClickHouse env and assumes you've configured all of it there. So a stray/half-filled entry in `additionalEnv` would suppress the whole block. Keep `additionalEnv: []` and use the native `clickhouse.*` keys.
 
-If you'd rather not touch the Application at all, the alternative is inlining the datastore manifests into the chart's `extraManifests: []` value — also one app, but you'd be pasting full StatefulSets into your values file, which is messier than keeping them as their own source. I'd go with the multi-source approach above.
+Verify after re-syncing:
+
+```bash
+kubectl -n aidata get deploy langfuse-web -o yaml | grep -A1 CLICKHOUSE_MIGRATION_URL
+# should show: value: clickhouse://clickhouse.aidata.svc.cluster.local:9000
+```
+
+If it's still empty after that, check that your values file is actually reaching the release — `helm template` or the ArgoCD "manifests" view should show the populated value. Given you're on the multi-source app, the usual culprit is the `$values` path not resolving, in which case *none* of your overrides apply and you'd see other defaults too.
