@@ -45,4 +45,37 @@ Then point the `image:` fields in `apps/langfuse/base/{postgres,clickhouse,valke
 
 One thing worth checking: if the Helm release itself is trying to pull `bitnami/postgresql`, then a subchart `deploy:` flag flipped back to `true` somewhere — those should all be `false`. If you did intend to let the chart manage the databases, the only valid source now is `bitnamilegacy/*` with `global.security.allowInsecureImages: true`, but I'd steer you away from that on Graviton since those frozen images aren't guaranteed arm64.
 
-Want me to update the bundle's manifests and `values-stg.yaml` with the ECR image paths filled in so you can drop them straight in?
+Yes — `bitnami/valkey:latest` "working" is actually its own problem, just a quieter one. It didn't error, but that doesn't mean it's right.
+
+**Why valkey pulled but the other two didn't.** When Broadcom deleted the public `docker.io/bitnami` catalog, they kept a *small community subset* published — but only on the rolling `latest` tag. Valkey happens to be in that subset, so `bitnami/valkey:latest` still resolves. PostgreSQL's *versioned* tags (like `:16`) were all moved out to `bitnamilegacy`, so `bitnami/postgresql:16` is gone. ClickHouse isn't in the free `latest` subset at all, so `bitnami/clickhouse:latest` is gone too. So the three results are all consistent with the same deprecation — valkey just slipped through on the one tag that's left.
+
+**Why you still shouldn't use it:**
+1. `:latest` is an unpinned, dev-only, no-longer-updated tag. You don't know what version you're freezing into ECR, and you'll never get a patch. Not something to build staging on.
+2. A successful `docker pull` tells you nothing about architecture. Bitnami images aren't guaranteed to ship arm64, and a plain `docker pull && tag && push` grabs **only your machine's arch** (amd64 on most CI) and pushes that single arch to ECR — so on Graviton it'll `exec format error`, or silently run emulated. The pull "succeeding" hid all of that.
+
+**The clean fix is the same for all three — use the official multi-arch images, including valkey:**
+
+```
+postgres:16                       (instead of bitnami/postgresql)
+clickhouse/clickhouse-server:25.8 (instead of bitnami/clickhouse)
+valkey/valkey:8                   (instead of bitnami/valkey:latest)
+```
+
+Mirror them with a manifest-list-aware copy so both arches land in ECR:
+
+```bash
+crane copy docker.io/library/postgres:16     $ECR/postgres:16
+crane copy clickhouse/clickhouse-server:25.8  $ECR/clickhouse-server:25.8
+crane copy valkey/valkey:8                     $ECR/valkey:8
+```
+
+Then **verify arm64 is actually present** in each ECR image — this is the check that would have caught the valkey issue:
+
+```bash
+docker buildx imagetools inspect $ECR/valkey:8
+# you should see BOTH linux/amd64 and linux/arm64 listed
+```
+
+If you ever do a plain `docker pull`, add `--platform linux/arm64` so you don't mirror amd64 by accident.
+
+So: re-mirror valkey from `valkey/valkey:8` the same way as the other two, drop `bitnami/valkey:latest`, and confirm each ECR tag lists `linux/arm64`. Want me to add the `imagetools inspect` verification as a quick script for all your images at once?
