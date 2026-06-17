@@ -1,18 +1,32 @@
-Two different things are getting merged here, and untangling them is basically the whole answer.
+Let me confirm the exact value key from the chart before I tell you what to change.
 
-- The **app name** (the `app`/label on a Deployment) is cosmetic — selectors use it to bind pods, but Langfuse never sees it. It doesn't affect connectivity. Name it whatever's meaningful.
-- The **service name** is the DNS hostname pods actually connect to. This is the thing that has to match `redis.host`.
+Yes — that's exactly the cause, and it's a rough edge in how the bundle set it. Here's the mechanism:
 
-So: does the service name need to match the chart's auto-generated host? It depends which path you're on.
+The Langfuse chart **always emits its own `NEXTAUTH_URL`**, rendered from the native value `langfuse.nextauth.url` (which defaults to `http://localhost:3000` if you don't set it). The bundle additionally injected `NEXTAUTH_URL` through `langfuse.additionalEnv`. So the rendered container ends up with **two `env` entries named `NEXTAUTH_URL`** — one from the chart, one from your `additionalEnv`. Kubernetes env lists use `name` as the strategic‑merge key and it must be unique, so the Kustomize/ArgoCD patch fails on the duplicate.
 
-- If you set `redis.deploy: false` and provide `redis.host` yourself (the clean path): No. Name the service anything you like and set `redis.host` to that service's DNS name. You're overriding the host, so the auto-generated name is irrelevant.
-- If you leave the chart on its bundled defaults and don't override the host: then it's auto-generated as `<release>-redis-...` — for release "langfuse" that's something like `langfuse-redis-primary` (some subchart versions use `-master` instead). A hand-made service would have to match that string exactly. This is the fragile path — avoid it.
+**Fix: stop setting it via `additionalEnv`; set it through the chart's own field instead.** In `apps/langfuse/values/values-stg.yaml`:
 
-Don't guess the suffix — confirm what your chart actually emits:
-
-```bash
-helm template langfuse langfuse/langfuse -f values.yaml | grep -iE "redis"
-kubectl get svc | grep -i redis
+Remove this:
+```yaml
+langfuse:
+  additionalEnv:
+    - name: NEXTAUTH_URL          # ← delete this entry
+      value: "https://langfuse-stg.<domain>"
 ```
 
-Recommendation: decouple it. Set `redis.deploy: false`, name your Redis service whatever you want, and point `redis.host` at it. If Redis is in a different namespace, use the full form `redis-svc.<namespace>.svc.cluster.local`.
+And set it natively (alongside the nextauth secret you already have):
+```yaml
+langfuse:
+  nextauth:
+    url: "https://langfuse-stg.<domain>"   # exact ingress host, https, no trailing slash
+    secret:
+      secretKeyRef:
+        name: langfuse-poc-secrets
+        key: nextauth-secret
+```
+
+Now the chart renders a single `NEXTAUTH_URL` and the patch applies cleanly. (If `additionalEnv` becomes empty after removing it, just set `additionalEnv: []` or drop the key.)
+
+**The general rule that avoids this everywhere:** `additionalEnv` is only for variables the chart *doesn't* already manage. The chart generates `NEXTAUTH_URL`, `NEXTAUTH_SECRET`, `SALT`, `ENCRYPTION_KEY`, `DATABASE_URL`, the `CLICKHOUSE_*`, `REDIS_*`, and `LANGFUSE_S3_*` vars from its native value keys. Duplicating any of those in `additionalEnv` produces the same duplicate‑key patch error — so configure each through its native value, and reserve `additionalEnv` for genuinely extra settings.
+
+Want me to correct `values-stg.yaml` in the bundle (move `NEXTAUTH_URL` to `nextauth.url`) and hand it back ready to drop in?
