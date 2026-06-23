@@ -1,46 +1,83 @@
-Let me check exactly how the chart wires that env var so I give you the precise fix.
-
-Found it — I read the chart template, and this is a values gap, not a bug.
-
-The chart builds that env var like this:
-
-```
-- name: CLICKHOUSE_MIGRATION_URL
-  {{- if .Values.clickhouse.migration.url }}     # ← uses this if set
-  {{- else if .Values.clickhouse.host }}          # ← else derives clickhouse://<host>:9000
-  {{- else if .Values.clickhouse.deploy }}        # ← else (deploy:true) auto-derives
-```
-
-With `clickhouse.deploy: false`, the var is **only emitted if `clickhouse.migration.url` or `clickhouse.host` is set**. If both are blank, the chart skips it entirely and langfuse-web starts with no `CLICKHOUSE_MIGRATION_URL` → exactly your error. So your running values almost certainly have those two fields empty.
-
-**Fix — set the host and the migration URL** (this is what's in the file I shared):
-
-```yaml
-clickhouse:
-  deploy: false
-  host: "clickhouse.aidata.svc.cluster.local"
-  httpPort: 8123
-  nativePort: 9000
-  database: default
-  clusterEnabled: false
-  auth:
-    username: default
-    existingSecret: langfuse-poc-secrets
-    existingSecretKey: clickhouse-password
-  migration:
-    url: "clickhouse://clickhouse.aidata.svc.cluster.local:9000"
-    autoMigrate: true
-```
-
-Two things that trip people up here:
-- **It must be the `clickhouse://` scheme on the native port `9000`**, not the HTTP `8123` endpoint. `CLICKHOUSE_URL` (HTTP/8123) and `CLICKHOUSE_MIGRATION_URL` (native/9000) are two different vars; the chart derives the HTTP one from `host` + `httpPort` and the migration one from `migration.url`.
-- **Do not put any `CLICKHOUSE_*` var in `additionalEnv`.** The very top of that template says: if `CLICKHOUSE_MIGRATION_URL` is found in `additionalEnv`, the chart does *nothing* for ClickHouse env and assumes you've configured all of it there. So a stray/half-filled entry in `additionalEnv` would suppress the whole block. Keep `additionalEnv: []` and use the native `clickhouse.*` keys.
-
-Verify after re-syncing:
+Below are the commands, grouped by the question each one answers. Set these first so the rest paste cleanly:
 
 ```bash
-kubectl -n aidata get deploy langfuse-web -o yaml | grep -A1 CLICKHOUSE_MIGRATION_URL
-# should show: value: clickhouse://clickhouse.aidata.svc.cluster.local:9000
+NS=portal              # your namespace
+FE=portal-frontend     # frontend deployment name
+BE=portal-backend      # backend deployment name
+# discover real names if unsure:
+kubectl get deploy,svc,ingress -n $NS
 ```
 
-If it's still empty after that, check that your values file is actually reaching the release — `helm template` or the ArgoCD "manifests" view should show the populated value. Given you're on the multi-source app, the usual culprit is the `$values` path not resolving, in which case *none* of your overrides apply and you'd see other defaults too.
+**1. Is this log even server-side? (settles the biggest fork for free)**
+
+The single most informative check costs nothing. If your `Bearer undefined` and `has cookie true` lines appear in the *pod's* stdout, the interceptor is running on the Next.js **server** — browser `console.log` never reaches pod logs. That alone points at the "server can't read an HttpOnly/browser-held token" cause.
+
+```bash
+kubectl logs -n $NS deploy/$FE --tail=300 | grep -iE 'bearer|user/me|has cookie'
+```
+
+If those lines show up here → server-side execution confirmed. If they *only* appear in browser devtools and not here → it's client-side, and kubectl won't help much past step 2 (jump to the browser section).
+
+**2. Does the frontend even have its auth config? (highest value, lowest effort)**
+
+A missing `NEXTAUTH_SECRET`, wrong `NEXTAUTH_URL`, or absent Azure client config silently produces a session with no token attached.
+
+```bash
+kubectl exec -n $NS deploy/$FE -- env | grep -iE 'NEXT|AUTH|AZURE|OIDC|CLIENT|API|TENANT'
+```
+
+Look specifically for: `NEXTAUTH_URL` matching your real frontend URL, `NEXTAUTH_SECRET` present, and the API base resolving to `https://api.stg.portal.mycompany.com/api`.
+
+**3. Is auth being terminated at the ALB? (the other big fork)**
+
+If the ALB does OIDC, the token arrives as a header (`x-amzn-oidc-accesstoken`), not from any JS library — and SSR calls to the external URL get bounced to a login redirect.
+
+```bash
+kubectl describe ingress -n $NS | grep -iE 'auth|oidc'
+# or full annotations:
+kubectl get ingress -n $NS -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{.metadata.annotations}{"\n\n"}{end}'
+```
+
+Presence of `alb.ingress.kubernetes.io/auth-type: oidc` (or `authenticate-oidc`) means your interceptor should read the OIDC header, not a cookie/store.
+
+**4. Reproduce the call from inside the pod (exposes the SSR + external-URL trap)**
+
+Your `BaseURL` is the *external* address. If SSR calls it, the request leaves the cluster, hits the ALB, and — with no browser cookies and possibly OIDC interception — comes back as a redirect or 401.
+
+```bash
+kubectl exec -n $NS deploy/$FE -- sh -c \
+  'curl -sI https://api.stg.portal.mycompany.com/api/user/me'
+```
+
+A `302` to a login page → ALB OIDC is intercepting; SSR will never carry the token this way. A clean `401` → backend reached, just no/!valid token. Also test the in-cluster path to compare:
+
+```bash
+kubectl exec -n $NS deploy/$FE -- sh -c "curl -s -o /dev/null -w '%{http_code}\n' http://$BE:<port>/api/user/me"
+```
+
+**5. What does the backend actually receive?**
+
+Confirms whether the literal string `Bearer undefined` even reaches it (vs the request dying earlier).
+
+```bash
+kubectl logs -n $NS deploy/$BE --tail=200 -f | grep -i 'user/me'
+```
+
+If you control the backend, temporarily log the incoming `Authorization` and `x-amzn-oidc-*` headers — that tells you definitively what's arriving.
+
+**6. Are the manually-created secrets actually populated?**
+
+You mentioned secrets are hand-created K8s Secrets — easy to have an empty or mis-keyed value.
+
+```bash
+kubectl get secret -n $NS
+kubectl get secret <secret-name> -n $NS -o jsonpath='{.data}' | jq 'keys'   # keys only
+# confirm a value is non-empty without dumping it:
+kubectl get secret <secret-name> -n $NS -o jsonpath='{.data.NEXTAUTH_SECRET}' | base64 -d | wc -c
+```
+
+**Browser side (for the client-side branch — kubectl can't see this):**
+
+If step 1 showed the logs are *not* in the pod, the truth is in devtools: Network tab → the `/user/me` request → Request Headers (what `Authorization` actually got sent), and Application → Cookies (whether the session cookie is flagged `HttpOnly` — if so, `document.cookie` can't read it, which is your bug).
+
+Run 1, 2, and 3 first — those three usually tell you which of the four causes you're in. Paste back the output of step 1 (server vs client) and step 3 (any OIDC annotations) and I can tell you the exact fix rather than the family.
