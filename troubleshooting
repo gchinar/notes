@@ -1,83 +1,62 @@
-Below are the commands, grouped by the question each one answers. Set these first so the rest paste cleanly:
+You've now isolated it to the exact line of code: SSR has the request, the cookie is on that request, and the extraction returns `undefined`. That means one of two things is true — either **the token was never in the cookie** (it's somewhere else, or the cookie is just an opaque session pointer), or **it's in the cookie but not in a form your code can read** (wrong name, encrypted, or chunked). Which one decides the fix entirely, and the cookie's *name* tells you immediately.
 
-```bash
-NS=portal              # your namespace
-FE=portal-frontend     # frontend deployment name
-BE=portal-backend      # backend deployment name
-# discover real names if unsure:
-kubectl get deploy,svc,ingress -n $NS
+**Fastest disambiguation — read the cookie name (no deploy needed):**
+Browser devtools → Application → Cookies → your domain. Look at the exact name(s):
+
+- `AWSELBAuthSessionCookie-0` / `-1` → **AD SSO is terminated at the ALB.** This is the trap your environment makes most likely. The ALB cookie is an *opaque* session reference — the token was never in it. The ALB injects the actual token as a **request header** (`x-amzn-oidc-accesstoken`) on requests passing through it. Your SSR is reading a cookie that structurally cannot contain the token, so it's `undefined` 100% of the time.
+- `__Secure-next-auth.session-token`, or `next-auth.session-token.0` / `.1` → **NextAuth/Auth.js.** Several sub-causes below.
+
+**Confirm what SSR actually sees** (add this where you extract the token):
+
+```js
+// App Router
+import { cookies, headers } from 'next/headers';
+console.log('cookies:', cookies().getAll().map(c => c.name));
+console.log('oidc header:', !!headers().get('x-amzn-oidc-accesstoken'));
+
+// Pages Router (getServerSideProps / API route)
+console.log('cookies:', req.headers.cookie?.split(';').map(s => s.split('=')[0].trim()));
+console.log('oidc header:', !!req.headers['x-amzn-oidc-accesstoken']);
 ```
 
-**1. Is this log even server-side? (settles the biggest fork for free)**
+`kubectl logs -n portal deploy/portal-frontend | grep -iE 'cookies:|oidc header:'` and read the names off it.
 
-The single most informative check costs nothing. If your `Bearer undefined` and `has cookie true` lines appear in the *pod's* stdout, the interceptor is running on the Next.js **server** — browser `console.log` never reaches pod logs. That alone points at the "server can't read an HttpOnly/browser-held token" cause.
+---
 
-```bash
-kubectl logs -n $NS deploy/$FE --tail=300 | grep -iE 'bearer|user/me|has cookie'
+**If it's ALB OIDC** — stop reading the cookie. Read the header the ALB injected:
+
+```js
+const token = req.headers['x-amzn-oidc-accesstoken']; // Pages
+// or headers().get('x-amzn-oidc-accesstoken')        // App Router
 ```
 
-If those lines show up here → server-side execution confirmed. If they *only* appear in browser devtools and not here → it's client-side, and kubectl won't help much past step 2 (jump to the browser section).
+(`x-amzn-oidc-data` is the signed JWT with claims; `-accesstoken` is the raw token for calling downstream APIs.) Verify the annotation is actually there: `kubectl get ingress -n portal -o jsonpath='{..annotations}' | tr ',' '\n' | grep -i auth`.
 
-**2. Does the frontend even have its auth config? (highest value, lowest effort)**
+**If it's NextAuth** — the reason raw extraction fails is usually one (or more) of these:
 
-A missing `NEXTAUTH_SECRET`, wrong `NEXTAUTH_URL`, or absent Azure client config silently produces a session with no token attached.
+1. **The cookie is encrypted (JWE), not a readable JWT.** You can't `jwtDecode()` or base64-decode it — that's almost certainly why you get `undefined`. Decrypt it the supported way:
+   ```js
+   import { getToken } from 'next-auth/jwt';
+   const token = await getToken({ req, secret: process.env.NEXTAUTH_SECRET });
+   const bearer = token?.accessToken;
+   ```
+2. **Name mismatch.** Over HTTPS the cookie is `__Secure-next-auth.session-token`, so code looking for `next-auth.session-token` finds nothing. `getToken()` handles the prefix for you; manual reads don't.
+3. **Chunking.** Azure tokens are large, so NextAuth splits the cookie into `.0`/`.1`. Manual reads of the base name get `undefined`; `getToken()` reassembles them.
+4. **The access token was never attached to the session.** Even with everything above correct, `accessToken` is `undefined` unless your callbacks persist it:
+   ```js
+   callbacks: {
+     async jwt({ token, account }) {
+       if (account) token.accessToken = account.access_token;
+       return token;
+     },
+     async session({ session, token }) {
+       session.accessToken = token.accessToken;
+       return session;
+     },
+   }
+   ```
+   Also confirm `NEXTAUTH_SECRET` is actually set in the pod (`kubectl exec -n portal deploy/portal-frontend -- printenv NEXTAUTH_SECRET`) — a missing/mismatched secret makes `getToken()` silently return null.
 
-```bash
-kubectl exec -n $NS deploy/$FE -- env | grep -iE 'NEXT|AUTH|AZURE|OIDC|CLIENT|API|TENANT'
-```
+If the name is *neither* of those, the cookie is likely a homegrown opaque session ID, in which case SSR can't extract a token from it at all — it has to call your backend's session/token endpoint (forwarding the cookie) to exchange it for one.
 
-Look specifically for: `NEXTAUTH_URL` matching your real frontend URL, `NEXTAUTH_SECRET` present, and the API base resolving to `https://api.stg.portal.mycompany.com/api`.
-
-**3. Is auth being terminated at the ALB? (the other big fork)**
-
-If the ALB does OIDC, the token arrives as a header (`x-amzn-oidc-accesstoken`), not from any JS library — and SSR calls to the external URL get bounced to a login redirect.
-
-```bash
-kubectl describe ingress -n $NS | grep -iE 'auth|oidc'
-# or full annotations:
-kubectl get ingress -n $NS -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{.metadata.annotations}{"\n\n"}{end}'
-```
-
-Presence of `alb.ingress.kubernetes.io/auth-type: oidc` (or `authenticate-oidc`) means your interceptor should read the OIDC header, not a cookie/store.
-
-**4. Reproduce the call from inside the pod (exposes the SSR + external-URL trap)**
-
-Your `BaseURL` is the *external* address. If SSR calls it, the request leaves the cluster, hits the ALB, and — with no browser cookies and possibly OIDC interception — comes back as a redirect or 401.
-
-```bash
-kubectl exec -n $NS deploy/$FE -- sh -c \
-  'curl -sI https://api.stg.portal.mycompany.com/api/user/me'
-```
-
-A `302` to a login page → ALB OIDC is intercepting; SSR will never carry the token this way. A clean `401` → backend reached, just no/!valid token. Also test the in-cluster path to compare:
-
-```bash
-kubectl exec -n $NS deploy/$FE -- sh -c "curl -s -o /dev/null -w '%{http_code}\n' http://$BE:<port>/api/user/me"
-```
-
-**5. What does the backend actually receive?**
-
-Confirms whether the literal string `Bearer undefined` even reaches it (vs the request dying earlier).
-
-```bash
-kubectl logs -n $NS deploy/$BE --tail=200 -f | grep -i 'user/me'
-```
-
-If you control the backend, temporarily log the incoming `Authorization` and `x-amzn-oidc-*` headers — that tells you definitively what's arriving.
-
-**6. Are the manually-created secrets actually populated?**
-
-You mentioned secrets are hand-created K8s Secrets — easy to have an empty or mis-keyed value.
-
-```bash
-kubectl get secret -n $NS
-kubectl get secret <secret-name> -n $NS -o jsonpath='{.data}' | jq 'keys'   # keys only
-# confirm a value is non-empty without dumping it:
-kubectl get secret <secret-name> -n $NS -o jsonpath='{.data.NEXTAUTH_SECRET}' | base64 -d | wc -c
-```
-
-**Browser side (for the client-side branch — kubectl can't see this):**
-
-If step 1 showed the logs are *not* in the pod, the truth is in devtools: Network tab → the `/user/me` request → Request Headers (what `Authorization` actually got sent), and Application → Cookies (whether the session cookie is flagged `HttpOnly` — if so, `document.cookie` can't read it, which is your bug).
-
-Run 1, 2, and 3 first — those three usually tell you which of the four causes you're in. Paste back the output of step 1 (server vs client) and step 3 (any OIDC annotations) and I can tell you the exact fix rather than the family.
+Paste the cookie name(s) from devtools and I'll give you the precise extraction code for your case.
