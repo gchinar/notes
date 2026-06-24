@@ -1,37 +1,43 @@
-`verifyToken()` returning `undefined` is a verdict, not just a failure — it means the function ran, looked for a token, and found nothing to verify. So despite the backend receiving *a* request, at the point of verification there is no usable token string. The whole chain now rests on one question you can answer in a single log line: **what exact string is `verifyToken()` being handed?** Everything branches off that, and you haven't logged it yet — you've logged its *output*, not its *input*.
+Important correction before you chase case 3: the literal string `"undefined"` is **not** "header absent." It's the opposite — the header *is* present, and its value is exactly what `` `Bearer ${token}` `` produces when `token` is `undefined`. That rules out stripping/proxy/forwarding theories. It pins the bug to one mechanical fact:
 
-Log the input, right at the top of the function:
+**At the line that builds the header, the token variable is `undefined`.** Then it gets stringified and sent. This is the *same* `Bearer undefined` you opened with — we've now confirmed the loop: SSR's read of the cookie returns nothing, and that nothing is interpolated into the string. There is no JWT because none was ever extracted.
+
+So there's nothing left to decode on the backend, and nothing more to find by reading the cookie. Two fixes, and you need both:
+
+**Fix 1 — stop stringifying undefined (do this regardless).** A missing token is silently becoming a valid-looking broken header, which is what made this hard to see. Guard the construction:
 
 ```js
-function verifyToken(req) {
-  const authHeader = req.headers['authorization'] ?? req.headers['Authorization'];
-  console.log('VT raw header:', JSON.stringify(authHeader));
-  // ... existing logic
+if (!token) {
+  // SSR: bounce to login or fail loudly — never build the header
+  return { redirect: { destination: '/api/auth/signin', permanent: false } };
 }
+const authHeader = `Bearer ${token}`;
 ```
 
-```bash
-kubectl logs -n portal deploy/portal-backend --tail=100 -f | grep 'VT raw header'
+That kills the misleading symptom. It does not solve it — `token` is still undefined. That's Fix 2.
+
+**Fix 2 — why the SSR read returns nothing.** One self-check decides it. Dump the headers SSR receives and look for one key:
+
+```js
+console.log('oidc?', !!req.headers['x-amzn-oidc-accesstoken']);
 ```
 
-Read the output — it lands in one of four buckets, each a different bug:
+**If `true` → ALB OIDC, and this is almost certainly your case given the environment.** Your SSO is terminated at the ALB. The browser cookie (`AWSELBAuthSessionCookie-*`) is an *opaque* session pointer — the token was never in it, so reading the cookie correctly returns `undefined` every time. The token rides as a header. Read that instead:
 
-**1. `"Bearer undefined"`** → the frontend is still sending an empty token; the SSR extraction you thought was fixed isn't returning a value. The backend is correct to reject. Back to the frontend — but now you *know* it's the source, not the backend.
+```js
+const token = req.headers['x-amzn-oidc-accesstoken'];
+```
 
-**2. `"Bearer eyJ..."` (a real JWT) but `verifyToken` still returns undefined** → the token arrives fine; your *parsing* drops it. Almost always one of:
-   - Splitting wrong: `authHeader.split(' ')[1]` vs expecting just the raw token, or a case/whitespace mismatch on `"Bearer "`.
-   - `verifyToken` returns `undefined` on a verification *exception* (bad signature, audience, expiry) instead of throwing — so a *validation* failure masquerades as a *missing* token. Wrap the verify in try/catch and log the actual error; that's likely the real story and puts you back on the `aud`/`iss`/`kid` diagnosis from before.
+(`x-amzn-oidc-data` is the signed-claims JWT; `-accesstoken` is the raw token for calling your backend.)
 
-**3. `undefined` / header absent entirely** → the header isn't reaching the backend at all. This is the one your *environment* makes likely, and it has two classic causes:
-   - **The ALB/OIDC or an intermediate hop stripped or renamed it.** ALB OIDC surfaces tokens as `x-amzn-oidc-accesstoken`, not `Authorization`; if the backend only reads `Authorization`, it sees nothing. Dump *all* headers (`console.log(JSON.stringify(req.headers))`) and look for `x-amzn-oidc-*`.
-   - **SSR didn't forward it.** The token existed in the SSR request context, but the server-to-backend axios call is a *new* request that doesn't inherit headers — so you must attach it explicitly:
-     ```js
-     axios.get('/user/me', { headers: { Authorization: `Bearer ${token}` } });
-     ```
-     If the SSR axios instance reads the token from a module-level variable or browser store (which is empty on the server), this is exactly your bug.
+**If `false` → NextAuth, and the cookie is an encrypted JWE** — manual decoding *cannot* produce a token, which is your `undefined`. Read it the supported way:
 
-**4. The header name differs** (e.g. lowercased by the proxy, or under a custom name) → `req.headers['Authorization']` is undefined but `req.headers['authorization']` isn't. Node lowercases header keys; reading the capitalized form returns undefined. The `??` in the snippet above covers this, but check whether your real code does.
+```js
+import { getToken } from 'next-auth/jwt';
+const t = await getToken({ req, secret: process.env.NEXTAUTH_SECRET });
+const token = t?.accessToken;
+```
 
-Given the path you've traced — token gets extracted in SSR, request reaches backend, but verification sees nothing — bucket **3 (not forwarded, or arriving as `x-amzn-oidc-*` rather than `Authorization`)** is the most probable. The full-headers dump on the backend distinguishes 3 from the rest instantly: if you see `x-amzn-oidc-accesstoken` but no `authorization`, read that header; if you see neither, SSR isn't forwarding; if you see `authorization: "Bearer undefined"`, it's the frontend.
+If that's *still* undefined, the access token was never attached/minted — attach it in the `jwt`/`session` callbacks, and confirm you logged in with the scope `api://<backend-app-id>/.default` (without an API scope Azure issues no usable access token, so there's nothing to attach).
 
-Paste the `VT raw header` line plus the full `req.headers` dump (redact token values) and that's the last branch — I'll give you the exact fix.
+Given your stack is ALB-fronted and the cookie reads as an "SSO cookie" whose extraction yields nothing, run the `oidc?` check first — that pattern (opaque cookie present, token in `x-amzn-oidc-accesstoken`) matches your symptom exactly.
