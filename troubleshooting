@@ -1,32 +1,37 @@
-This is real progress: the request now *carries* an Authorization header all the way to the backend, and the backend is the one rejecting it. That moves the failure from "no token" to "token present but not accepted" — a completely different layer, and one the backend can tell you the exact reason for. The frontend extraction is essentially solved; don't touch it further until you know *why* the backend says invalid, because "invalid" has several distinct causes that need different fixes.
+`verifyToken()` returning `undefined` is a verdict, not just a failure — it means the function ran, looked for a token, and found nothing to verify. So despite the backend receiving *a* request, at the point of verification there is no usable token string. The whole chain now rests on one question you can answer in a single log line: **what exact string is `verifyToken()` being handed?** Everything branches off that, and you haven't logged it yet — you've logged its *output*, not its *input*.
 
-The single most useful thing now is to make the backend log *why* it rejected, not just that it did:
-
-```bash
-kubectl logs -n portal deploy/portal-backend --tail=200 -f | grep -iE 'auth|token|jwt|401|invalid|expired|audience|signature|issuer'
-```
-
-If the framework only says "unauthorized" without a reason, temporarily log the specifics at the validation point — these are the fields that actually decide validity:
+Log the input, right at the top of the function:
 
 ```js
-// at the point where validation fails, log the decoded (unverified) claims:
-const [, payload] = token.split('.');
-console.log('claims', JSON.parse(Buffer.from(payload, 'base64url').toString()));
-// log: aud, iss, exp, scp/roles, and the kid from the header
+function verifyToken(req) {
+  const authHeader = req.headers['authorization'] ?? req.headers['Authorization'];
+  console.log('VT raw header:', JSON.stringify(authHeader));
+  // ... existing logic
+}
 ```
 
-Map what you see to the cause — these are the usual ones, in rough order of likelihood for an Azure AD + ALB/NextAuth setup:
+```bash
+kubectl logs -n portal deploy/portal-backend --tail=100 -f | grep 'VT raw header'
+```
 
-**1. Audience mismatch (most common).** The token's `aud` is whoever *requested* it. If the ALB minted it, `aud` is the ALB's OIDC client ID; if NextAuth minted it with `.default` on the frontend's app registration, `aud` may be the frontend's ID — neither matches the backend's expected audience. The backend validates `aud == its-own-app-id` and rejects. Fix is one of: request the token with the *backend's* API scope (`api://<backend-app-id>/.default`), or configure the backend to accept that audience.
+Read the output — it lands in one of four buckets, each a different bug:
 
-**2. Wrong token type — you forwarded the id_token, not an access token.** An id_token's `aud` is the client app and it's not meant for API authorization. If `aud` looks like a client ID and there's no `scp`/`roles` claim, that's the tell. Make sure you're forwarding the access token (`x-amzn-oidc-accesstoken`, or `account.access_token`), not the id_token.
+**1. `"Bearer undefined"`** → the frontend is still sending an empty token; the SSR extraction you thought was fixed isn't returning a value. The backend is correct to reject. Back to the frontend — but now you *know* it's the source, not the backend.
 
-**3. `Bearer undefined` is literally still arriving** — i.e. the frontend "fix" is sending the string but the value is empty. Quick to rule out: the backend log shows the header as the literal `Bearer undefined` rather than `Bearer eyJ...`. If so, the extraction isn't actually returning a value; back to that. But your wording ("invalid auth," not "missing") suggests a real token is arriving.
+**2. `"Bearer eyJ..."` (a real JWT) but `verifyToken` still returns undefined** → the token arrives fine; your *parsing* drops it. Almost always one of:
+   - Splitting wrong: `authHeader.split(' ')[1]` vs expecting just the raw token, or a case/whitespace mismatch on `"Bearer "`.
+   - `verifyToken` returns `undefined` on a verification *exception* (bad signature, audience, expiry) instead of throwing — so a *validation* failure masquerades as a *missing* token. Wrap the verify in try/catch and log the actual error; that's likely the real story and puts you back on the `aud`/`iss`/`kid` diagnosis from before.
 
-**4. Issuer mismatch (Azure v1 vs v2).** `iss` is `https://login.microsoftonline.com/<tenant>/v2.0` for v2 but `https://sts.windows.net/<tenant>/` for v1. If the backend's expected issuer / OIDC discovery URL is configured for the other version, signature/issuer validation fails. Check `iss` against what the backend expects.
+**3. `undefined` / header absent entirely** → the header isn't reaching the backend at all. This is the one your *environment* makes likely, and it has two classic causes:
+   - **The ALB/OIDC or an intermediate hop stripped or renamed it.** ALB OIDC surfaces tokens as `x-amzn-oidc-accesstoken`, not `Authorization`; if the backend only reads `Authorization`, it sees nothing. Dump *all* headers (`console.log(JSON.stringify(req.headers))`) and look for `x-amzn-oidc-*`.
+   - **SSR didn't forward it.** The token existed in the SSR request context, but the server-to-backend axios call is a *new* request that doesn't inherit headers — so you must attach it explicitly:
+     ```js
+     axios.get('/user/me', { headers: { Authorization: `Bearer ${token}` } });
+     ```
+     If the SSR axios instance reads the token from a module-level variable or browser store (which is empty on the server), this is exactly your bug.
 
-**5. Signature / key (`kid`) can't be validated.** The backend can't fetch or match the signing key from Azure's JWKS — often an egress problem in-cluster (the pod can't reach `login.microsoftonline.com`), a cached stale JWKS, or (in the ALB case) the token is signed by the *ALB*, whose `x-amzn-oidc-data` is ES256-signed with AWS's regional key, not Azure's — so a backend expecting Azure's JWKS will reject it outright. If you're on ALB OIDC, verify which token you're validating and against whose keys.
+**4. The header name differs** (e.g. lowercased by the proxy, or under a custom name) → `req.headers['Authorization']` is undefined but `req.headers['authorization']` isn't. Node lowercases header keys; reading the capitalized form returns undefined. The `??` in the snippet above covers this, but check whether your real code does.
 
-**6. Expiry.** `exp` in the past — clock skew, or a token cached/reused too long. Least likely on a fresh login, but `exp` vs now is trivial to check in the claims dump.
+Given the path you've traced — token gets extracted in SSR, request reaches backend, but verification sees nothing — bucket **3 (not forwarded, or arriving as `x-amzn-oidc-*` rather than `Authorization`)** is the most probable. The full-headers dump on the backend distinguishes 3 from the rest instantly: if you see `x-amzn-oidc-accesstoken` but no `authorization`, read that header; if you see neither, SSR isn't forwarding; if you see `authorization: "Bearer undefined"`, it's the frontend.
 
-So the decisive data is three claims — `aud`, `iss`, and whether `scp`/`roles` exists — plus the `kid` from the header. Paste those (values can be redacted, but tell me whether `aud` matches the backend's app ID and which `iss` version it is), along with whether auth is terminated at the ALB or in NextAuth, and I can name the exact misconfiguration instead of the category.
+Paste the `VT raw header` line plus the full `req.headers` dump (redact token values) and that's the last branch — I'll give you the exact fix.
