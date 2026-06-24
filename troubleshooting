@@ -1,62 +1,32 @@
-You've now isolated it to the exact line of code: SSR has the request, the cookie is on that request, and the extraction returns `undefined`. That means one of two things is true — either **the token was never in the cookie** (it's somewhere else, or the cookie is just an opaque session pointer), or **it's in the cookie but not in a form your code can read** (wrong name, encrypted, or chunked). Which one decides the fix entirely, and the cookie's *name* tells you immediately.
+This is real progress: the request now *carries* an Authorization header all the way to the backend, and the backend is the one rejecting it. That moves the failure from "no token" to "token present but not accepted" — a completely different layer, and one the backend can tell you the exact reason for. The frontend extraction is essentially solved; don't touch it further until you know *why* the backend says invalid, because "invalid" has several distinct causes that need different fixes.
 
-**Fastest disambiguation — read the cookie name (no deploy needed):**
-Browser devtools → Application → Cookies → your domain. Look at the exact name(s):
+The single most useful thing now is to make the backend log *why* it rejected, not just that it did:
 
-- `AWSELBAuthSessionCookie-0` / `-1` → **AD SSO is terminated at the ALB.** This is the trap your environment makes most likely. The ALB cookie is an *opaque* session reference — the token was never in it. The ALB injects the actual token as a **request header** (`x-amzn-oidc-accesstoken`) on requests passing through it. Your SSR is reading a cookie that structurally cannot contain the token, so it's `undefined` 100% of the time.
-- `__Secure-next-auth.session-token`, or `next-auth.session-token.0` / `.1` → **NextAuth/Auth.js.** Several sub-causes below.
-
-**Confirm what SSR actually sees** (add this where you extract the token):
-
-```js
-// App Router
-import { cookies, headers } from 'next/headers';
-console.log('cookies:', cookies().getAll().map(c => c.name));
-console.log('oidc header:', !!headers().get('x-amzn-oidc-accesstoken'));
-
-// Pages Router (getServerSideProps / API route)
-console.log('cookies:', req.headers.cookie?.split(';').map(s => s.split('=')[0].trim()));
-console.log('oidc header:', !!req.headers['x-amzn-oidc-accesstoken']);
+```bash
+kubectl logs -n portal deploy/portal-backend --tail=200 -f | grep -iE 'auth|token|jwt|401|invalid|expired|audience|signature|issuer'
 ```
 
-`kubectl logs -n portal deploy/portal-frontend | grep -iE 'cookies:|oidc header:'` and read the names off it.
-
----
-
-**If it's ALB OIDC** — stop reading the cookie. Read the header the ALB injected:
+If the framework only says "unauthorized" without a reason, temporarily log the specifics at the validation point — these are the fields that actually decide validity:
 
 ```js
-const token = req.headers['x-amzn-oidc-accesstoken']; // Pages
-// or headers().get('x-amzn-oidc-accesstoken')        // App Router
+// at the point where validation fails, log the decoded (unverified) claims:
+const [, payload] = token.split('.');
+console.log('claims', JSON.parse(Buffer.from(payload, 'base64url').toString()));
+// log: aud, iss, exp, scp/roles, and the kid from the header
 ```
 
-(`x-amzn-oidc-data` is the signed JWT with claims; `-accesstoken` is the raw token for calling downstream APIs.) Verify the annotation is actually there: `kubectl get ingress -n portal -o jsonpath='{..annotations}' | tr ',' '\n' | grep -i auth`.
+Map what you see to the cause — these are the usual ones, in rough order of likelihood for an Azure AD + ALB/NextAuth setup:
 
-**If it's NextAuth** — the reason raw extraction fails is usually one (or more) of these:
+**1. Audience mismatch (most common).** The token's `aud` is whoever *requested* it. If the ALB minted it, `aud` is the ALB's OIDC client ID; if NextAuth minted it with `.default` on the frontend's app registration, `aud` may be the frontend's ID — neither matches the backend's expected audience. The backend validates `aud == its-own-app-id` and rejects. Fix is one of: request the token with the *backend's* API scope (`api://<backend-app-id>/.default`), or configure the backend to accept that audience.
 
-1. **The cookie is encrypted (JWE), not a readable JWT.** You can't `jwtDecode()` or base64-decode it — that's almost certainly why you get `undefined`. Decrypt it the supported way:
-   ```js
-   import { getToken } from 'next-auth/jwt';
-   const token = await getToken({ req, secret: process.env.NEXTAUTH_SECRET });
-   const bearer = token?.accessToken;
-   ```
-2. **Name mismatch.** Over HTTPS the cookie is `__Secure-next-auth.session-token`, so code looking for `next-auth.session-token` finds nothing. `getToken()` handles the prefix for you; manual reads don't.
-3. **Chunking.** Azure tokens are large, so NextAuth splits the cookie into `.0`/`.1`. Manual reads of the base name get `undefined`; `getToken()` reassembles them.
-4. **The access token was never attached to the session.** Even with everything above correct, `accessToken` is `undefined` unless your callbacks persist it:
-   ```js
-   callbacks: {
-     async jwt({ token, account }) {
-       if (account) token.accessToken = account.access_token;
-       return token;
-     },
-     async session({ session, token }) {
-       session.accessToken = token.accessToken;
-       return session;
-     },
-   }
-   ```
-   Also confirm `NEXTAUTH_SECRET` is actually set in the pod (`kubectl exec -n portal deploy/portal-frontend -- printenv NEXTAUTH_SECRET`) — a missing/mismatched secret makes `getToken()` silently return null.
+**2. Wrong token type — you forwarded the id_token, not an access token.** An id_token's `aud` is the client app and it's not meant for API authorization. If `aud` looks like a client ID and there's no `scp`/`roles` claim, that's the tell. Make sure you're forwarding the access token (`x-amzn-oidc-accesstoken`, or `account.access_token`), not the id_token.
 
-If the name is *neither* of those, the cookie is likely a homegrown opaque session ID, in which case SSR can't extract a token from it at all — it has to call your backend's session/token endpoint (forwarding the cookie) to exchange it for one.
+**3. `Bearer undefined` is literally still arriving** — i.e. the frontend "fix" is sending the string but the value is empty. Quick to rule out: the backend log shows the header as the literal `Bearer undefined` rather than `Bearer eyJ...`. If so, the extraction isn't actually returning a value; back to that. But your wording ("invalid auth," not "missing") suggests a real token is arriving.
 
-Paste the cookie name(s) from devtools and I'll give you the precise extraction code for your case.
+**4. Issuer mismatch (Azure v1 vs v2).** `iss` is `https://login.microsoftonline.com/<tenant>/v2.0` for v2 but `https://sts.windows.net/<tenant>/` for v1. If the backend's expected issuer / OIDC discovery URL is configured for the other version, signature/issuer validation fails. Check `iss` against what the backend expects.
+
+**5. Signature / key (`kid`) can't be validated.** The backend can't fetch or match the signing key from Azure's JWKS — often an egress problem in-cluster (the pod can't reach `login.microsoftonline.com`), a cached stale JWKS, or (in the ALB case) the token is signed by the *ALB*, whose `x-amzn-oidc-data` is ES256-signed with AWS's regional key, not Azure's — so a backend expecting Azure's JWKS will reject it outright. If you're on ALB OIDC, verify which token you're validating and against whose keys.
+
+**6. Expiry.** `exp` in the past — clock skew, or a token cached/reused too long. Least likely on a fresh login, but `exp` vs now is trivial to check in the claims dump.
+
+So the decisive data is three claims — `aud`, `iss`, and whether `scp`/`roles` exists — plus the `kid` from the header. Paste those (values can be redacted, but tell me whether `aud` matches the backend's app ID and which `iss` version it is), along with whether auth is terminated at the ALB or in NextAuth, and I can name the exact misconfiguration instead of the category.
