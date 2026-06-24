@@ -1,159 +1,133 @@
-<thinking>This is a critical reveal. The whole architecture I was diagnosing was wrong — it's neither ALB OIDC nor NextAuth. It's a custom flow:
+<thinking>OK, important new data point. Now the user says:
 
-1. Backend handles SSO (AD)
-2. Backend generates its own JWT
-3. Backend passes JWT to frontend via URL parameter (query string, like `?token=eyJ...` or maybe in a redirect)
-4. Frontend stores it as a cookie
+- Cookie has a VALID JWT (so the write is fine — the cookie genuinely contains `eyJ...`, not the string "undefined")
+- But SSR can't read it
 
-And then SSR reads the cookie to build the Authorization header — but gets `undefined`.
+This contradicts the previous message where they said the cookie value was literally "undefined". So either:
+- They were looking at it at a different time/state before, or
+- The browser now shows a valid JWT in the cookie
 
-So now the bug is in this custom handoff. Let me think about where `undefined` could come from in THIS flow:
+Let me take this at face value: **right now, in the browser, the cookie contains a real valid JWT. But SSR reads it as undefined.**
 
-The flow is: backend redirects to frontend with `?token=xxx` → frontend reads the URL param → frontend writes it to a cookie → later, SSR reads that cookie → SSR builds `Bearer ${token}`.
+This is a classic and very specific situation. If the cookie genuinely has a valid JWT in the browser but SSR can't read it, the question is: **why would a cookie that exists in the browser not be readable by SSR?**
 
-The `undefined` means: at SSR read time, the cookie either (a) doesn't exist, (b) exists but the value is empty/undefined, or (c) exists under a different name than SSR reads.
+A cookie set via `document.cookie` (client-side JS) IS sent to the server on subsequent requests — UNLESS something about its attributes or the request prevents it. Let me enumerate the real reasons SSR can't read a cookie that's visibly present in the browser:
 
-Given this custom flow, the most likely failure points:
+**1. The cookie was set client-side AFTER the SSR request, and SSR isn't re-running.**
+This is the #1 cause. The flow:
+- Backend redirects → frontend lands → client JS reads URL param → client JS writes cookie via `document.cookie`.
+- But SSR (getServerSideProps / server component) ran on the *initial* request — BEFORE the client JS wrote the cookie. So at SSR time, the cookie didn't exist.
+- Now you look in the browser and see the cookie (because client JS set it). But that SSR pass already happened with no cookie.
+- On a full page navigation/refresh, SSR would now see it — UNLESS the navigation is client-side (Next.js Link / router.push), which does NOT re-trigger a fresh document request, so SSR data fetching may use the cookie or not depending...
 
-**A. The URL-param → cookie write happens client-side, but SSR reads before/without it.**
-This is the big one. If the backend redirects to the frontend with `?token=`, and the frontend reads `window.location.search` (client-side only) and sets the cookie via `document.cookie` (client-side only) — then:
-- The very first request (the redirect landing) is SSR. At that moment, there's no cookie yet (it hasn't been written — the JS hasn't run). SSR tries to read the cookie → undefined.
-- The token is sitting in the URL query param, which SSR *could* read from `req.query`, but the code is reading the cookie instead.
+Actually, let me think harder. In Next.js:
 
-So there's a classic ordering problem: token is in the URL on the SSR request, but the code only looks at the cookie, which only gets populated after client-side hydration.
+- `getServerSideProps` runs on the server for the initial page load (full document request) and ALSO runs on client-side navigations (but via a data fetch request `/_next/data/...` which DOES include cookies).
+- Server Components run on the server.
 
-**B. The cookie write itself produces "undefined".**
-If the client does something like:
-```js
-const token = getQueryParam('token'); // returns undefined if param name mismatch
-document.cookie = `token=${token}`; // writes literally "token=undefined"
-```
-Then the cookie value is the string "undefined" — which matches EXACTLY the symptom they reported earlier ("the value is literally the js converted to string 'undefined'").
+The key insight: **a cookie set by `document.cookie` is only sent to the server on requests the browser makes AFTER the cookie is set.** If SSR ran during the redirect-landing request (before the cookie write), it saw nothing. The browser now shows the cookie. But that specific SSR execution already failed.
 
-This is huge. They said the value is literally "undefined" stringified. That means:
-- Somewhere, `undefined` got interpolated into a string.
-- If it's the cookie that contains "undefined", then the cookie WRITE captured an undefined value.
-- That means at write time, the token was undefined → the URL param read returned undefined.
+So the real question is timing/sequence: is the SSR call that fails happening BEFORE the cookie is written?
 
-So the bug may actually be earlier than I thought: the URL param extraction returns undefined, writes "undefined" to the cookie, and then SSR reads "undefined" from the cookie and builds "Bearer undefined".
+**2. Cookie attributes prevent it from being sent to the SSR endpoint.**
+- **Path mismatch:** if the cookie was set with `path=/home` (or some sub-path) but SSR runs on a different path, the cookie isn't sent. Cookies set via `document.cookie` default to the path of the current page, NOT `/`. So if the cookie was written while on `/home` without an explicit `path=/`, it's scoped to `/home` and won't be sent on requests to other paths. This is a SUPER common bug.
+- **Domain mismatch:** if SSR makes the request to a different subdomain than where the cookie's domain is scoped.
+- **SameSite:** if SameSite=Strict and the request is cross-site... but SSR reading its own cookie on same-site navigation should be fine. SameSite affects cross-site. Probably not the issue for same-origin SSR.
+- **Secure:** if Secure is set and somehow the SSR-triggering request is over HTTP... unlikely in this HTTPS setup.
 
-Wait — but they also said earlier "has cookie true but token value is undefined" and "there is no JWT token to decode, the value is literally the js converted to string 'undefined'". 
+**3. SSR isn't reading cookies from the right place.**
+- In App Router, you must use `cookies()` from `next/headers`. If you try to read `document.cookie` in a server component, it's undefined (no document on server).
+- In Pages Router, read `req.headers.cookie` or `context.req.cookies`.
+- If the code reads from a client-only source, SSR gets undefined.
 
-Let me reconcile. The cookie EXISTS (has cookie true) but its value is the string "undefined". That's consistent with: the cookie write happened, but with an undefined value. Which means the URL-param read failed.
+**4. The fetch from SSR to the backend doesn't forward the cookie.**
+Wait — but this is about SSR reading the cookie, not forwarding. Let me re-read: "ssr can't read it". So SSR can't READ the cookie value at all.
 
-Common reasons the URL-param read fails:
-1. **Param name mismatch.** Backend sends `?token=` but frontend reads `accessToken` or `jwt` or `access_token`. Or vice versa.
-2. **The token is in the URL fragment (`#token=`) not the query (`?token=`).** Fragments are NOT sent to the server and are read differently client-side (`window.location.hash` not `window.location.search`). If backend puts it after `#` and frontend reads `?`, → undefined.
-3. **Reading the URL param server-side when it's only there client-side, or timing.** 
-4. **The redirect already consumed/stripped the param.** E.g., a middleware redirect drops query params. Or the param was URL-encoded and decoding failed.
-5. **The cookie write captured the param before it was available** (React state timing — reading from a hook that hasn't populated).
+Let me focus. The most likely causes, ranked, for "cookie visibly present in browser but SSR reads undefined":
 
-But actually, the simplest and most likely: the param NAME is wrong, so the read returns undefined.
+**A. Path scoping (very likely given the earlier "/home" clue).** Earlier they logged "has cookie true /home". If the cookie was set via `document.cookie` while on the `/home` page without `path=/`, the browser scopes it to `path=/home`. It shows up in devtools (cookies are listed regardless of path), and it's sent on requests to `/home` — but NOT to other paths like `/` or `/dashboard` or wherever SSR for `/user/me` context runs. So SSR on a different path reads no cookie. This fits "/home" appearing in their log AND the cookie being visible but unreadable from SSR elsewhere.
 
-Let me also consider: is reading from a URL param and storing in a JS-readable cookie even the right architecture? There are real problems with this:
-- Token in URL is a security smell (logged in browser history, server access logs, referer headers). But that's a separate concern from the bug.
-- If the cookie is set client-side via document.cookie, it's NOT HttpOnly, so SSR *can* read it (it's sent with requests). So SSR reading the cookie should work IF the cookie has a real value. The problem is the value is "undefined".
+**B. Timing — cookie set client-side after SSR already ran.** SSR on the redirect-landing executed before the client wrote the cookie. You see the cookie now, but the SSR pass that built the header ran cookie-less. On a refresh it might work — unless path scoping (A) also blocks it.
 
-So the chain of causation, refined:
-1. Backend redirects to frontend with token in URL (`?token=eyJ...` or `#token=` or some param name).
-2. Frontend client-side code reads the param — **but reads the wrong name or wrong location (query vs fragment)** → gets undefined.
-3. Frontend writes `document.cookie = "X=undefined"` → cookie now literally contains "undefined".
-4. SSR (or client) reads the cookie → gets the string "undefined".
-5. Builds `Bearer undefined`.
+**C. SSR reading from the wrong source** (document.cookie on server, or wrong API). Reads undefined because there's no document server-side.
 
-The decisive diagnostic: look at the actual redirect URL the backend sends, and the actual cookie value, and compare the param name the frontend reads.
+**D. HttpOnly confusion** — but they said the cookie is set client-side via document.cookie, which can't be HttpOnly, and they can see the JWT in devtools, so it's readable by JS. Not HttpOnly. So this isn't it. Actually wait — if they can see a "valid JWT" in the cookie in devtools, and it's not HttpOnly, then document.cookie can read it client-side. The issue is specifically SERVER-side reading.
 
-Let me give them concrete steps:
+Given the earlier "/home" clue, I think **path scoping (A)** is the strongest hypothesis, closely followed by **timing (B)**. Both stem from the same root: the cookie is being set client-side via `document.cookie`, which gives it (1) a default path of the current page and (2) an existence only after client JS runs.
 
-1. **Capture the actual redirect URL.** In the browser, Network tab, find the redirect FROM the backend TO the frontend (the 302, or the landing URL). Look at the EXACT query string. Is the token there? Under what param name? Is it after `?` or `#`?
+Let me give them the decisive diagnostic:
 
-2. **Find the frontend code that reads the param and writes the cookie.** Check:
-   - What param name does it read?
-   - Does it read `window.location.search` (query) or `window.location.hash` (fragment)?
-   - Does it guard against undefined before writing the cookie?
+1. **Check the cookie's Path attribute in devtools.** Application → Cookies → click the cookie → look at the "Path" column. If it's `/home` (or anything other than `/`), that's the bug — SSR on any other path won't receive it.
 
-3. **Compare param names.** This is probably the bug — mismatch between what backend sends and what frontend reads.
+2. **Check what SSR actually sees in the raw Cookie header.** Log `req.headers.cookie` (Pages) or `cookies().getAll()` (App Router) in SSR and compare to browser. If the cookie name is absent from `req.headers.cookie`, the browser isn't sending it to this path → path/domain scoping. If it's present but your code reads undefined → you're reading from the wrong source.
 
-Let me think about whether there's anything in the K8s environment relevant here... Not really. This is purely an app-level handoff bug. The redirect could theoretically be affected by ALB if the ALB rewrites URLs, but unlikely. I'll keep focus on the app.
+3. **Confirm where SSR reads from.** App Router needs `cookies()` from next/headers; reading document.cookie server-side = undefined.
 
-Actually, one more environment-relevant thing: if there's an ALB doing path-based routing or the redirect URL is constructed with an internal hostname vs external, the redirect could land wrong. But the symptom (cookie contains "undefined") points squarely at param-read failure, not routing.
-
-Let me also reconsider: they said SSR reads the cookie. If the cookie is set by `document.cookie` (non-HttpOnly), and SSR reads it from `req.headers.cookie`, that works — non-HttpOnly cookies are still sent to the server. So the architecture *can* work. The bug is the value.
-
-But wait — there's a subtle timing issue too. The FIRST time the user lands (right after backend redirect), the URL has the token but the cookie doesn't exist yet (client JS hasn't run to set it). If SSR runs on that first landing and tries to read the cookie, it's empty. The cookie only gets set after hydration. So on subsequent navigations the cookie exists. But the value being "undefined" suggests the write happened but with bad data — so it's past the timing issue and into the value issue.
-
-So my primary hypothesis: **param name or query-vs-fragment mismatch causes the client read to return undefined, which gets written to the cookie as the string "undefined".**
-
-Secondary: **the cookie write isn't guarding undefined**, which is the proximate cause of the literal "undefined" string regardless.
-
-Let me write this up. I should:
-- Reframe: the architecture is now clear, and it's a custom token handoff, not ALB/NextAuth. Acknowledge this changes the diagnosis.
-- Point out the cookie containing literal "undefined" means the WRITE captured undefined — so the bug is upstream of the cookie, at the URL-param read.
-- Give the decisive diagnostic: capture the real redirect URL, check param name and query-vs-fragment.
-- List the specific likely causes in this flow.
-- Give the fix for the proximate symptom (guard the write) and the root cause (match the param).
-
-I should be concise but thorough. This is a debugging conversation; the user is technical and we've been going back and forth narrowing. I've been giving fairly long structured responses and the user keeps engaging, so the format is working. But I should make sure I'm leading with the key insight (the architecture reveal changes things, and the cookie value being "undefined" localizes the bug to the URL-param read) and not burying it.
-
-Let me be careful not to over-format. I'll use some bold for the key diagnostic branches but keep it readable. Given the technical debugging nature and that the user has responded well to structured responses with code snippets, I'll keep a similar format but tighten it.
-
-Let me think about what's truly decisive here and lead with it. The single most important realization: **the cookie contains the literal string "undefined", which means at the moment the frontend wrote the cookie, the value it had was `undefined`. Since the frontend gets the token from the URL parameter, the URL-parameter read is what's returning undefined.** So we've moved the bug one more hop upstream — from "SSR can't read the cookie" to "the cookie was poisoned at write time because the URL param read failed."
-
-The decisive check: look at the actual redirect URL from the backend and the param name the frontend reads.
-
-Let me write it.
-
-Language check: English.That reveal changes the diagnosis completely — this is neither ALB OIDC nor NextAuth, it's a **custom token handoff**, and it relocates the bug one more hop upstream. Here's the key deduction:
-
-You confirmed the cookie's value is the literal string `"undefined"`. A cookie can only contain that if, **at the moment the frontend wrote it, the value it had was `undefined`.** And the frontend gets that value from the URL parameter. So the failing step isn't SSR reading the cookie — SSR is faithfully reading exactly what was stored. The bug is at the **write**: the URL-parameter read returned `undefined`, and that got stringified straight into the cookie.
-
-So the chain is now:
-
-```
-backend redirect (?token=eyJ...) → frontend reads URL param → gets undefined → document.cookie = "token=undefined" → SSR reads "undefined" → Bearer undefined
-```
-
-Everything downstream is working correctly on poisoned data. Fix the read, and the rest of the chain you've already built will carry a real token.
-
-**Decisive check — capture the actual redirect URL.** Browser → Network tab → find the redirect *from* the backend *to* the frontend (the 302, or the landing request). Look at the raw URL and answer two things:
-
-1. **What is the exact parameter name?** Backend might send `?token=`, `?access_token=`, `?jwt=`, `?accessToken=` — and the frontend code reads a *different* name. A mismatch returns `undefined`. This is the most common cause.
-2. **Is the token after `?` or after `#`?** This one's a classic and very easy to miss:
-   - `?token=...` is a **query parameter** → read with `new URLSearchParams(window.location.search)` (and it *is* sent to the server).
-   - `#token=...` is a **URL fragment** → it is **never sent to the server**, and must be read with `window.location.hash`. If the backend puts it after `#` and the frontend reads `search` (or vice versa), the read returns `undefined`.
-
-Then find the frontend code doing the read+write and compare:
-
-```js
-// what name / location does this actually read?
-const params = new URLSearchParams(window.location.search); // query
-const token = params.get('token');        // ← does 'token' match the backend's param name?
-// or, if backend used a fragment:
-// const token = new URLSearchParams(window.location.hash.slice(1)).get('token');
-
-document.cookie = `token=${token}`;        // ← if token is undefined, this writes the literal "undefined"
-```
-
-**Two fixes, both needed:**
-
-**1. Guard the write (kills the misleading symptom immediately).** Never let `undefined` become a cookie:
-
-```js
-if (!token) {
-  console.error('No token in redirect URL — params:', window.location.search, window.location.hash);
-  // bounce back to login rather than poisoning the cookie
-} else {
+The fix for path scoping:
+- When setting the cookie client-side, ALWAYS include `path=/`:
+  ```js
   document.cookie = `token=${token}; path=/; Secure; SameSite=Lax`;
-}
+  ```
+- Without `path=/`, the cookie defaults to the directory path of the current document.
+
+The fix for timing: have the backend set the cookie directly (Set-Cookie on the redirect), so it exists before any SSR runs, and ideally HttpOnly.
+
+Let me also reconcile the contradiction: earlier they said cookie value was "undefined", now they say it's a valid JWT. Maybe they fixed the param read (guard/match), so now the cookie has a real JWT — and the NEXT layer of the bug surfaced: SSR can't read it. That's a coherent progression. So we've fixed the write, and now we're back to the SSR-read problem, but this time the cookie genuinely has a good value. So the remaining issue is purely: why can't SSR read a present, valid cookie? → path scoping or timing or wrong-source.
+
+Let me write this up concisely. Lead with the key insight: a cookie set client-side via document.cookie has TWO properties that bite SSR — default path scoping and post-SSR timing. Given the "/home" clue, path scoping is the prime suspect.
+
+I want to be concise here. The conversation has been long with detailed responses. The user is clearly technical and we're zeroing in. Let me lead with the decisive check (the Path attribute) and the reasoning, then the fix.
+
+I should not over-format. Let me lead with the insight, give the one decisive check, explain the two mechanisms, and the fix.
+
+Actually let me reconsider whether to lead with path. The "/home" clue is from many messages ago: "has cookie true /home". That strongly suggests the cookie's path is /home, or that the check happened on the /home route. Combined with "cookie set as client-side cookie from URL param" (document.cookie defaults path to current page), path=/home scoping is a very strong, specific, and checkable hypothesis. I'll lead with it but also cover timing and wrong-source since I can't see their code.
+
+Let me write.
+
+Language: English.</thinking>If the cookie holds a valid JWT in the browser but SSR reads `undefined`, you've hit the defining weakness of a **client-side-set cookie**: `document.cookie` writes are invisible to the server in two specific ways, and your earlier `/home` clue points hard at the first one.
+
+**Prime suspect — path scoping. Check this first, it's one click.**
+Devtools → Application → Cookies → click your token cookie → look at the **Path** column.
+
+A cookie set with `document.cookie` defaults its path to *the directory of the page that set it* — not `/`. Your token gets written on `/home` (matching your "has cookie true /home" log), so the browser scopes it to `Path=/home`. The consequence:
+
+- Devtools lists it regardless of path, so it *looks* present. ✓
+- The browser only sends it on requests **under `/home`**. ✗
+- SSR for any other route gets no cookie in `req.headers.cookie` → your read returns `undefined`.
+
+So the cookie is real, valid, and simply **not being transmitted** to the SSR path that needs it. If the Path shows `/home` (or anything but `/`), that's the bug.
+
+**Confirm what SSR actually receives** (don't infer from devtools — log the raw header):
+
+```js
+// Pages Router
+console.log('SSR raw cookie header:', req.headers.cookie);
+
+// App Router
+import { cookies } from 'next/headers';
+console.log('SSR cookies:', cookies().getAll().map(c => c.name));
 ```
 
-The log line tells you instantly whether the token is in `search`, in `hash`, or genuinely absent.
+```bash
+kubectl logs -n portal deploy/portal-frontend | grep -i 'SSR'
+```
 
-**2. Match the read to what the backend actually sends** — correct param name and correct query-vs-fragment. That's the root cause; once the read returns the real JWT, the cookie holds it, SSR reads it, and `Bearer eyJ...` reaches the backend, which will now validate.
+- **Cookie name absent** from that output → it's not being *sent* → path (or domain) scoping. This is the likely one.
+- **Cookie name present** but your code still reads undefined → you're reading from the **wrong source** (e.g. trying `document.cookie` in a server component — there's no `document` on the server; App Router must use `cookies()` from `next/headers`, Pages must use `req.headers.cookie`).
 
-A couple of things worth flagging on this architecture while you're in here:
+**Fix — set the cookie with an explicit root path:**
 
-- **Token in a URL is a real security exposure** — it lands in browser history, server/ALB access logs, and any `Referer` header. If you can, switch the handoff so the backend sets the cookie itself on the redirect response (`Set-Cookie`, ideally `HttpOnly`) instead of passing the token through the URL for JS to store. That removes this entire class of bug *and* the exposure. (If you go `HttpOnly`, remember SSR reads it from `req.headers.cookie` server-side, not `document.cookie`.)
-- **One-render timing trap to be aware of:** on the very first landing after the redirect, the URL has the token but the cookie doesn't exist yet (the client write hasn't run). If SSR runs on that first paint and reads the cookie, it's empty until after hydration. Your "value is literally undefined" symptom is past this — it's a write-value problem, not a timing one — but it's the next thing that bites once the value is fixed, so guard SSR for "cookie not present yet" too.
+```js
+document.cookie = `token=${token}; path=/; Secure; SameSite=Lax`;
+```
 
-Paste the redirect URL's query/fragment (you can redact the token itself, just keep the **param name** and whether it's `?` or `#`) and the few lines that read it, and I'll confirm the exact one-line fix.
+That single missing `path=/` is the most common cause of "visible in browser, invisible to SSR." With it, the cookie rides along on every route and SSR reads it.
+
+**The two other mechanisms to rule out while you're here:**
+
+- **Timing.** A `document.cookie` write only exists *after* the client JS runs. If SSR executed on the redirect-landing request — before that write — it saw nothing, even though the cookie appears now. With `path=/` fixed, a refresh will confirm; if it works on refresh but not on first landing, it's this.
+- **Domain.** If SSR's request resolves to a different subdomain than where the cookie is scoped, it won't be sent. Less likely on same-origin, but check the Domain attribute too.
+
+**The architectural fix that removes all three at once:** have the **backend** set the cookie on its redirect response (`Set-Cookie: token=...; Path=/; HttpOnly; Secure; SameSite=Lax`) instead of passing the token in the URL for client JS to store. Then the cookie exists before any SSR runs (no timing gap), is correctly path-scoped, and — if `HttpOnly` — is readable by SSR via `req.headers.cookie` while being safe from XSS. The only adjustment: with `HttpOnly`, client-side JS can no longer read it, so all token access moves server-side, which for an SSR app is what you want anyway.
+
+Check the Path attribute and paste it back along with the `SSR raw cookie header` output — that'll confirm whether it's scoping (almost certainly) or a read-source mismatch, and the fix is the one-liner above.
