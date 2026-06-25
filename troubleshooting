@@ -1,47 +1,41 @@
-"Context lost" / "no request" is the decisive symptom, and it's a different bug from everything before: `cookies()` returning empty with *no request context* means the code is running **outside a request scope**. It isn't that the cookie is missing — it's that Next.js has no request to read cookies *from*. This is a code-placement problem, not a cookie problem.
+That rules out the cache-boundary theory — React's `cache()` does **not** sever request context the way `unstable_cache` does. `cache()` is just per-request memoization; it runs inside the same request scope, so `cookies()` *should* work inside it. So if you're still getting empty `[]` / "context lost," the cause is one of the remaining placement issues, not the cache wrapper itself.
 
-`cookies()` only works when there's an active request bound to it. It returns empty / throws "context lost" / "called outside a request scope" in exactly these places:
+Given `cache()` is innocent, here's what actually produces "no request context" — in order of likelihood now:
 
-**1. Inside a cache boundary (most likely, given the filename `cache.ts`).** If the `cookies()` call is inside `unstable_cache(...)` or a `'use cache'` function, Next.js deliberately severs request context — the whole point of that cache is to be shared across requests and users, so per-request data like cookies is *forbidden* inside it. That's your "context lost" verbatim. The cookie read must happen **outside** the cache, and the value passed **in**:
+**1. The `cache()`-wrapped function is being called at module load, not during a request.** This is the subtle one. `cache()` itself is fine, but *when you invoke the wrapped function* matters. If `cache.ts` does something like:
 
 ```js
-// ❌ broken — cookies() inside the cached scope, no request bound
-const getUser = unstable_cache(async () => {
-  const token = (await cookies()).get('token')?.value; // [] empty, context lost
-  return fetchUser(token);
+const getToken = cache(async () => (await cookies()).get('token')?.value);
+const result = getToken();           // ❌ called at module top-level → no request yet
+export default result;
+```
+
+…then the call executes at import time, before any request is bound. The `cache()` wrapper is irrelevant; the *invocation site* is outside a request. The wrapped function must be **called from within** a request-scoped function (a Server Component, route handler, or `getServerSideProps`), not at file scope.
+
+**2. `cache.ts` is reachable from the client bundle.** If anything with `'use client'` imports this module (directly or transitively), `cookies()` runs client-side where there is no server request → empty. Check the import chain. A single client component importing `cache.ts` poisons it.
+
+**3. The call is detached from the request by an async hop.** If the `cache()`-wrapped function is invoked from inside `after()`, a `setTimeout`, an unawaited promise, or any callback that runs after the response, Next.js's AsyncLocalStorage request context is gone. `cookies()` then sees no request. Make sure the call is `await`ed synchronously within the request flow, not fired into the background.
+
+**4. Version/runtime mismatch.** Two things to confirm:
+- **Next.js version.** `await cookies()` is the Next 15 async form. If this is Next 14 or earlier, `cookies()` is *synchronous* and `await`ing it behaves differently — check `kubectl exec -n portal deploy/portal-frontend -- cat package.json | grep next` (or `node_modules/next/package.json`).
+- **Edge vs Node runtime.** If the route declares `export const runtime = 'edge'`, the cookies API surface differs from Node. Check for a `runtime` export.
+
+The fastest way to see which: log the **call stack** at the point `cookies()` returns empty, so you can see *what invoked it*:
+
+```js
+export const getToken = cache(async () => {
+  const store = await cookies();
+  if (store.getAll().length === 0) {
+    console.log('EMPTY COOKIES — stack:', new Error().stack);
+  }
+  return store.get('token')?.value;
 });
-
-// ✅ read in request scope, pass token in as an argument
-async function getUser() {
-  const token = (await cookies()).get('token')?.value; // request context exists here
-  return cachedFetchUser(token);
-}
-const cachedFetchUser = unstable_cache(
-  async (token) => fetchUser(token),
-  ['user-me'],
-);
 ```
 
-(Caution: don't key a *shared* cache on a per-user token and cache the `/user/me` body, or you risk serving one user's data to another. For per-user data, prefer React's per-request `cache()` over `unstable_cache`.)
-
-**2. Called at module top-level / import time.** If `cookies()` runs when the module loads rather than inside a function that executes per-request, there's no request yet → empty. It must be *inside* the function that runs during the request, not at file scope.
-
-**3. Called from a Client Component or anything in the client bundle.** `cookies()` is server-only. If `cache.ts` gets imported into a `'use client'` path, there's no server request context → empty.
-
-**4. Called after an `await` that crossed out of the request** (some background task, `setTimeout`, `after()` callback, or a fire-and-forget promise). Less common, but it detaches from the request store.
-
-Given the file is named `cache.ts`, **#1 is overwhelmingly likely** — `cookies()` is being called inside the cached function. The fix is structural: pull the cookie read up into the request-scoped caller, and pass the token down as a parameter. The cache function should be pure with respect to its inputs and never touch `cookies()`/`headers()` directly.
-
-One quick confirmation — add a log at two points:
-
-```js
-// at module top of cache.ts (runs at import)
-console.log('cache.ts module load');
-
-// inside the function, before cookies()
-console.log('about to read cookies, in request?');
+```bash
+kubectl logs -n portal deploy/portal-frontend | grep -A15 'EMPTY COOKIES'
 ```
 
-If "module load" prints but the cookie read either never runs or runs detached, you'll see the placement clearly in `kubectl logs -n portal deploy/portal-frontend`.
+The stack tells you immediately whether the caller is a Server Component (should work — then it's a different problem), module top-level (#1), a client component (#2), or a background callback (#3).
 
-Show me the function in cache.ts that wraps the `cookies()` call — specifically whether it's inside `unstable_cache`/`'use cache'` or called at top level — and I'll give you the exact restructure.
+So the question that resolves this: **where is the `cache()`-wrapped function being *called* from, and is `cache.ts` imported by anything `'use client'`?** Paste the wrapped function plus its call site (the Server Component or route handler that invokes it) and I'll pinpoint it.
