@@ -1,215 +1,58 @@
-<thinking>This is the resolving clue. Let me think carefully.
+Stop and separate these — you now have **two different bugs**, and the line "even when the token IS present, the error still occurs" is the proof. As long as you treat them as one, neither will resolve. One is the intermittent context loss. The other is a failure that happens *with* a valid token, which by definition is not an auth-context problem at all. Diagnose them separately.
 
-`verifyToken()` is called from inside an **axios request interceptor**. And `verifyToken` reads `cookies()` (from next/headers).
+**Bug 1 — intermittent context. This isn't a flaky bug to patch; it's the expected signature of the interceptor architecture, and it can't be made reliable.**
 
-This is the bug. Here's why:
+`cookies()`/`headers()` only return data when the call sits in an unbroken async chain from the request handler. Your interceptor lives on a shared, module-level axios singleton. Whether context reaches it depends entirely on *how each call arrived*:
 
-An axios request interceptor runs **whenever a request is made through that axios instance**. The interceptor is registered once (typically at module load when the api service module is imported), but it *fires* at request time. The problem is: **the axios instance and its interceptor are detached from Next.js's request context (AsyncLocalStorage).**
+- Calls awaited directly inside a Server Component / route handler → chain intact → token extracted. ✓
+- Calls that arrived via a broken chain → no context → empty. ✗
 
-Let me think about this more precisely.
+The context-less ones are coming from somewhere that detached from the request: a response-interceptor **retry** (runs after the HTTP event, always outside scope), a **cached** result re-execution, **prefetch/streaming** render paths, a background/`after()` call, or simply a **second call site** that isn't in request scope. Under any concurrency, a singleton interceptor servicing multiple requests is inherently racy — and worse than just empty, it risks stamping one request's token onto another's call.
 
-Next.js's `cookies()` relies on `AsyncLocalStorage` to find the current request context. This context is available synchronously within the request's async call chain — Server Components, route handlers, server actions, getServerSideProps. The context propagates through `await` calls *as long as they're in the same async continuation chain* that started from the request handler.
-
-Now, an axios interceptor. When you do `axios.get('/user/me')` from within a Server Component, the call chain is:
-- Server Component (has request context)
-- → axios.get()
-- → interceptor fires
-- → verifyToken() → cookies()
-
-The question is: does the request context propagate through the axios interceptor?
-
-In principle, AsyncLocalStorage context DOES propagate through promise chains and async/await, even through library code, **as long as the async continuation is unbroken**. So if the Server Component awaits axios.get(), and the interceptor runs synchronously as part of that promise chain, the context *should* be available.
-
-BUT — and this is the key — there are several ways the axios interceptor breaks the context:
-
-1. **The axios instance is created at module load (singleton), and the interceptor is registered once.** When the interceptor fires, it runs in whatever async context the *request* was made from. If the request is made from a Server Component, context should propagate. BUT if the axios instance does any internal queuing, batching, connection pooling, or the interceptor itself isn't part of the synchronous promise chain from the caller, context can be lost.
-
-2. **More fundamentally: axios interceptors and adapters can break AsyncLocalStorage propagation.** Axios uses an adapter (http adapter in Node) that may involve event emitters, callbacks, or microtask scheduling that detaches from the ALS context. Actually, the request interceptor specifically runs *before* the adapter, as part of the promise chain, so it should usually be fine. But...
-
-3. **The real, common problem: the api service module / axios instance is shared as a module-level singleton, and the *first* time it's used or the way it's set up means the interceptor isn't running in request scope.**
-
-Hmm, let me reconsider. The user has been getting "context lost", "no request", empty cookies `[]`. This strongly indicates the interceptor is running OUTSIDE the request's AsyncLocalStorage context.
-
-The most likely reason: **The pattern of reading request context (cookies) inside an axios interceptor is fundamentally fragile in Next.js App Router**, because:
-
-- The axios instance is a module-level singleton created once.
-- Interceptors registered on it fire for every request.
-- While AsyncLocalStorage *can* propagate through promise chains, the indirection through axios's internal machinery (interceptor chain, adapter, request/response transformation, possibly connection reuse/keepalive, possibly retries) frequently detaches from the request context.
-
-Actually, the cleanest way to think about it: **`cookies()` must be called directly in the request flow, not deep inside a shared library's callback.** The recommended Next.js pattern is to read cookies in the Server Component / route handler / server action and *pass the token explicitly* to the data-fetching layer. Reading cookies inside an axios interceptor inverts this — the interceptor is generic infrastructure that has no business reaching back into per-request Next.js context.
-
-Let me also consider: even if context propagation worked, there's a deeper architectural issue. A shared axios instance with a global interceptor is request-agnostic. In a server environment handling concurrent requests for different users, a module-level singleton interceptor reading cookies is asking for either (a) lost context, or (b) worse, if it somehow caches, cross-request contamination.
-
-So the fix is architectural: **don't read cookies inside the axios interceptor.** Instead:
-
-Option A (cleanest): Read the token in the request-scoped code (Server Component, route handler), and pass it to the axios call explicitly — either as a per-call header, or by creating a per-request axios instance.
+So the fix is not "guard and retry the interceptor." It's to **remove request-context reads from the interceptor entirely** — the half-move you've made is why it's intermittent now instead of always-broken. Every server-side call reads the token in request scope and passes it explicitly:
 
 ```js
-// in the Server Component / route handler (request scope)
-import { cookies } from 'next/headers';
-
-async function getUser() {
-  const token = (await cookies()).get('token')?.value;
-  return apiClient.get('/user/me', {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-}
-```
-
-Option B: Create a per-request axios instance with the token baked in, created inside request scope:
-
-```js
-async function createServerApiClient() {
-  const token = (await cookies()).get('token')?.value;
-  return axios.create({
-    baseURL: process.env.API_BASE_URL,
-    headers: { Authorization: `Bearer ${token}` },
-  });
-}
-// then in request scope:
-const api = await createServerApiClient();
-await api.get('/user/me');
-```
-
-Option C: If you must use an interceptor, pass the token through axios config so the interceptor doesn't need cookies():
-
-Actually, the deeper point: the interceptor approach was probably designed for the CLIENT (browser), where there's no request context issue and you read the token from document.cookie or a store. The SAME api service module is being used on the server (SSR), where the interceptor's cookie-reading approach breaks because:
-
-- On client: interceptor reads token from client-side store/cookie → works.
-- On server: interceptor tries cookies() → no/lost request context → undefined → Bearer undefined.
-
-THIS is the crux. The api service is isomorphic (used both client and server), with a single interceptor that reads the token one way, and that way doesn't work on the server side.
-
-Let me reconsider the whole thread to confirm: They said "Request hits next.js SSR" and "SSR tries to extract bearer token from cookie but gets undefined". So the failing path is the SERVER-side use of the shared axios instance. The interceptor reads cookies() which fails in server context (when called from inside the interceptor, detached from request scope).
-
-So my diagnosis: **`cookies()` inside an axios request interceptor loses the Next.js request context because the interceptor — registered on a module-level singleton axios instance — does not reliably run within the request's AsyncLocalStorage scope.** The fix is to stop reading cookies inside the interceptor and instead read the token in request-scoped code and pass it explicitly to the axios call (or build a per-request client).
-
-Why does the interceptor lose context? Let me be precise and correct, because I don't want to state something false.
-
-AsyncLocalStorage (ALS) context propagation: ALS uses the async_hooks mechanism. Context propagates to async continuations. When you call an async function and await it, the context flows. Axios request interceptors are invoked as part of the promise chain when you call `axios.request()`. In theory, if you call `await axios.get(...)` from within request scope, the interceptor (which returns a promise that's chained) should run within the same ALS context.
-
-HOWEVER, there are well-documented cases where this breaks:
-
-1. **If the axios instance was created outside request scope and reuses something stateful.** The instance creation isn't the issue per se; it's the execution.
-
-2. **The adapter / http layer.** Axios's Node adapter uses Node's http module with callbacks and event emitters. Response interceptors definitely can lose context because they run after the http response event. Request interceptors run before, in the promise chain, so they're more likely to retain context — but not guaranteed depending on axios internals and how the interceptor chain is built (axios builds a promise chain: `Promise.resolve(config).then(requestInterceptor).then(dispatchRequest)...`). The `Promise.resolve().then()` should preserve ALS context.
-
-Hmm. So request interceptors *might* actually retain context in some setups. But the user is empirically observing "context lost" / empty cookies. So in THEIR setup it's broken.
-
-Possible reasons it's broken in their case even though request interceptors usually chain:
-- The axios instance / interceptor setup is being initialized at module load, and maybe the FIRST request or some requests are triggered in a context where ALS isn't set.
-- More likely: there's an async gap. For example, if the interceptor is `async` and does an `await` on something before calling cookies(), or if there's a queue.
-- Or the request that fails is genuinely being made from outside request scope (e.g., the api service is initialized/called at module load, or in a context without request).
-
-Actually — wait. Let me reconsider the simplest, most robust explanation that I'm confident is correct and actionable:
-
-**The Next.js-recommended and reliable pattern is to NOT read `cookies()` from deep inside shared library infrastructure like an axios interceptor.** Whether or not ALS *happens* to propagate is fragile and version/setup-dependent. The robust fix is to read cookies in request scope and pass the token explicitly.
-
-This is both correct and actionable, and it's what I should recommend. I can note that ALS propagation through axios interceptors is unreliable (which is empirically true for them — they're seeing it fail) without over-claiming the exact internal mechanism.
-
-But let me give the most likely SPECIFIC mechanism too, because the user has been drilling down and wants the exact cause:
-
-The most likely specific cause: **The axios instance is a shared singleton used by BOTH client and server. Its request interceptor reads the token in a way that works in the browser but loses request context on the server.** OR: **the interceptor runs detached from the request's ALS context because of an async hop in the interceptor chain or because the call originates outside request scope.**
-
-Let me also give a quick diagnostic to confirm whether it's "outside request scope" vs "context lost mid-chain":
-
-In the interceptor, log whether cookies() throws or returns empty, and the stack:
-```js
-apiClient.interceptors.request.use(async (config) => {
-  try {
-    const store = await cookies();
-    console.log('interceptor cookies count:', store.getAll().length, 'stack:', new Error().stack);
-    const token = store.get('token')?.value;
-    config.headers.Authorization = `Bearer ${token}`;
-  } catch (e) {
-    console.log('interceptor cookies() threw:', e.message);
-  }
-  return config;
+// request scope only — Server Component / route handler
+const token = (await headers()).get('authorization')?.replace('Bearer ', '')
+            ?? (await cookies()).get('token')?.value;
+const res = await apiClient.get('/user/me', {
+  headers: { Authorization: `Bearer ${token}` },
 });
 ```
 
-If it throws "called outside request scope" → definitively outside ALS context. If it returns empty array → context exists but no cookies (back to path scoping? no — they confirmed cookie has valid JWT). Actually they said earlier cookies() returns [] empty with "no request" / "context lost". So it's the outside-request-scope case.
+No `cookies()`/`headers()` anywhere inside the shared instance, no token-reading interceptor on the server path. Until that's true for *all* call sites, the intermittency stays.
 
-OK here's my refined, confident diagnosis and fix:
+**Bug 2 — errors with a valid token. The real cause is being swallowed by a generic message.**
 
-**Diagnosis:** Reading `cookies()` inside an axios request interceptor is the bug. The interceptor lives on a module-level (singleton) axios instance in the api service module. When the interceptor fires, it is not running inside Next.js's per-request AsyncLocalStorage context — so `cookies()` finds no request and returns empty ("context lost"). This is why the token is `undefined` and the header becomes `Bearer undefined`. Request-scoped APIs like `cookies()`/`headers()` are only valid when called synchronously within the request's own async chain (Server Component, route handler, server action, middleware) — not from inside generic shared infrastructure like an interceptor, which Next.js cannot guarantee runs in that scope.
-
-**Fix:** Stop reading cookies in the interceptor. Read the token in request scope and pass it explicitly.
-
-Let me give a clean fix.
-
-The cleanest fix given an isomorphic api service:
-
-For server-side calls, read the token in the Server Component / route handler and pass it:
-```js
-// request-scoped code
-import { cookies } from 'next/headers';
-const token = (await cookies()).get('token')?.value;
-const data = await apiService.getUserMe({ token }); 
-// or
-await apiClient.get('/user/me', { headers: { Authorization: `Bearer ${token}` }});
-```
-
-And remove the cookies() read from the interceptor (or make the interceptor only read from config/client store, not next/headers).
-
-If they want to keep an interceptor pattern, they can pass the token via a per-request axios instance created in request scope, or attach the token to the axios config and have the interceptor read config — but then there's no point in the interceptor reading cookies.
-
-Alternatively, a more advanced fix: use a request-scoped store. But the simplest robust fix is explicit passing.
-
-Let me write this concisely. This is likely the resolving message of the thread, so I want it to be clear and correct, and give the concrete fix.
-
-Format: This deserves a clear diagnosis statement, the why, and the fix with code. Not too long. I've been giving thorough responses; this one should land the conclusion firmly. Let me keep it focused — lead with "this is the bug", explain the mechanism crisply, give the fix.
-
-Language: English.</thinking>That's the bug — and it's the root cause the whole thread has been converging on. Reading `cookies()` **inside an axios request interceptor** is the thing that can't work on the server.
-
-Here's the mechanism. `cookies()` finds the current request through Next.js's `AsyncLocalStorage` — it only returns data when it's called *synchronously within the request's own async chain* (a Server Component, route handler, server action, or middleware). Your interceptor is registered once on a **module-level singleton axios instance** in the api service module. When it fires, it's running as generic, request-agnostic infrastructure — not inside any request's ALS scope. So `cookies()` sees no bound request, returns `[]`, and that's your literal "context lost / no request." Token `undefined` → `Bearer undefined`. Everything downstream was faithfully carrying that.
-
-The reason this was so hard to corner: that same interceptor almost certainly *works in the browser* (where it reads the token from a client-side store with no request-context requirement). The api service is isomorphic — one axios instance used both client and server — and the cookie-reading approach silently only holds on the client. On the SSR path, it breaks every time.
-
-This is also why it's not a path-scoping or Next-15-async problem (those were real adjacent issues, but not this). `cookies()` is simply being called from a place Next.js can't attach a request to.
-
-**The fix: don't read request state inside the interceptor. Read the token in request scope and pass it explicitly to the call.**
+"Something went wrong on the server / Fetching user details" is a catch-all. It tells you nothing about *why*. You can't diagnose a masked error — log the actual one, and correlate it with whether context was present, so each failure lands in a bucket:
 
 ```js
-// ❌ in the api service module — interceptor reaches into request context it doesn't have
-apiClient.interceptors.request.use(async (config) => {
-  const token = (await cookies()).get('token')?.value; // [] empty on server — no request bound
-  config.headers.Authorization = `Bearer ${token}`;
-  return config;
-});
-
-// ✅ read cookies where the request context actually exists, pass the token down
-// Server Component / route handler / server action:
-import { cookies } from 'next/headers';
-
-export async function getUserMe() {
-  const token = (await cookies()).get('token')?.value; // valid request scope here
-  return apiClient.get('/user/me', {
+try {
+  const res = await apiClient.get('/user/me', {
     headers: { Authorization: `Bearer ${token}` },
   });
-}
-```
-
-If you want to keep things centralized rather than threading `token` through every call, build a **per-request** client inside request scope instead of a shared singleton:
-
-```js
-import { cookies } from 'next/headers';
-
-export async function serverApi() {
-  const token = (await cookies()).get('token')?.value;
-  return axios.create({
-    baseURL: process.env.API_BASE_URL,
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  return res.data;
+} catch (err) {
+  console.error('[user/me] FAILED', {
+    tokenPresent: !!token,
+    status: err.response?.status,     // 401 / 403 / 500 ...
+    code: err.code,                   // ECONNREFUSED / ETIMEDOUT / EPROTO / CERT_* ...
+    body: err.response?.data,
+    message: err.message,
   });
+  throw err;
 }
-// usage, in request scope:  const api = await serverApi(); await api.get('/user/me');
 ```
 
-The principle: `cookies()`/`headers()` belong in request-scoped code, and the token gets **passed into** the data layer as an argument — never pulled from request context by shared infrastructure like a singleton interceptor. Keep the browser interceptor for the client path if you like, but the server path must hand the token in explicitly.
+```bash
+kubectl logs -n portal deploy/portal-frontend | grep '\[user/me\] FAILED'
+```
 
-Two things to verify once you move it:
+Read the bucket each failure falls into — they mean completely different things:
 
-- **Don't let it regress into a singleton.** A shared interceptor that stamped per-user tokens on the server is also a cross-request contamination risk, not just a context-loss bug. Per-request token passing fixes both.
-- **Guard the undefined.** Keep a `if (!token)` check at the read site so a missing cookie redirects to login instead of silently re-creating `Bearer undefined`.
+- **`tokenPresent: false`** → still Bug 1. That call came through a context-less path. Not a backend problem.
+- **`tokenPresent: true`, `status: 401/403`** → backend rejecting a *valid-looking* token. Back to the claims check from earlier — `aud`/`iss`/`exp`. The token is real but not accepted (audience or expiry mismatch).
+- **`tokenPresent: true`, `code: ECONNREFUSED/ETIMEDOUT/EPROTO/CERT_*`** → not auth at all. This is the **SSR-calling-the-external-URL** trap I flagged way back. Your `baseURL` is `https://api.stg.portal.mycompany.com/api` — when SSR calls that, the request leaves the pod, goes out to the ALB and back. That round trip can fail on TLS chain validation (Node is stricter than the browser), timeouts, or routing — intermittently. Fix is to have SSR call the backend by its **in-cluster service URL** (`http://portal-backend.portal.svc.cluster.local:<port>`), not the public ALB hostname.
+- **`tokenPresent: true`, `status: 500`** → the backend authenticated fine but the *endpoint logic* failed: user not found, an authorization/role check, or a downstream dependency (Aurora, Valkey). Check the backend logs for that request — the error is on its side now.
 
-Move the `cookies()` read out of the interceptor and into the Server Component/route handler that calls `/user/me`, pass the token as a header on that call, and the chain you've already built end-to-end will finally carry a real JWT to the backend.
+The decisive next step is the bucketed output. Paste a few `[user/me] FAILED` lines and we'll know instantly whether Bug 2 is a backend token rejection, an SSR-to-external-URL network/TLS failure, or a 500 in the endpoint itself — each has a different, specific fix, and the generic message has been hiding which one you're actually hitting.
