@@ -1,133 +1,21 @@
-<thinking>OK, important new data point. Now the user says:
+`await cookies()` is the correct App Router pattern, and it may be a real fix: in Next.js 15 the `cookies()`/`headers()` APIs became **async**. The old synchronous `const cookieStore = cookies()` returns a *pending promise*, so `.get('token')?.value` on it yields `undefined`. If that's what cache.ts was doing, you may have just fixed the read side.
 
-- Cookie has a VALID JWT (so the write is fine — the cookie genuinely contains `eyJ...`, not the string "undefined")
-- But SSR can't read it
-
-This contradicts the previous message where they said the cookie value was literally "undefined". So either:
-- They were looking at it at a different time/state before, or
-- The browser now shows a valid JWT in the cookie
-
-Let me take this at face value: **right now, in the browser, the cookie contains a real valid JWT. But SSR reads it as undefined.**
-
-This is a classic and very specific situation. If the cookie genuinely has a valid JWT in the browser but SSR can't read it, the question is: **why would a cookie that exists in the browser not be readable by SSR?**
-
-A cookie set via `document.cookie` (client-side JS) IS sent to the server on subsequent requests — UNLESS something about its attributes or the request prevents it. Let me enumerate the real reasons SSR can't read a cookie that's visibly present in the browser:
-
-**1. The cookie was set client-side AFTER the SSR request, and SSR isn't re-running.**
-This is the #1 cause. The flow:
-- Backend redirects → frontend lands → client JS reads URL param → client JS writes cookie via `document.cookie`.
-- But SSR (getServerSideProps / server component) ran on the *initial* request — BEFORE the client JS wrote the cookie. So at SSR time, the cookie didn't exist.
-- Now you look in the browser and see the cookie (because client JS set it). But that SSR pass already happened with no cookie.
-- On a full page navigation/refresh, SSR would now see it — UNLESS the navigation is client-side (Next.js Link / router.push), which does NOT re-trigger a fresh document request, so SSR data fetching may use the cookie or not depending...
-
-Actually, let me think harder. In Next.js:
-
-- `getServerSideProps` runs on the server for the initial page load (full document request) and ALSO runs on client-side navigations (but via a data fetch request `/_next/data/...` which DOES include cookies).
-- Server Components run on the server.
-
-The key insight: **a cookie set by `document.cookie` is only sent to the server on requests the browser makes AFTER the cookie is set.** If SSR ran during the redirect-landing request (before the cookie write), it saw nothing. The browser now shows the cookie. But that specific SSR execution already failed.
-
-So the real question is timing/sequence: is the SSR call that fails happening BEFORE the cookie is written?
-
-**2. Cookie attributes prevent it from being sent to the SSR endpoint.**
-- **Path mismatch:** if the cookie was set with `path=/home` (or some sub-path) but SSR runs on a different path, the cookie isn't sent. Cookies set via `document.cookie` default to the path of the current page, NOT `/`. So if the cookie was written while on `/home` without an explicit `path=/`, it's scoped to `/home` and won't be sent on requests to other paths. This is a SUPER common bug.
-- **Domain mismatch:** if SSR makes the request to a different subdomain than where the cookie's domain is scoped.
-- **SameSite:** if SameSite=Strict and the request is cross-site... but SSR reading its own cookie on same-site navigation should be fine. SameSite affects cross-site. Probably not the issue for same-origin SSR.
-- **Secure:** if Secure is set and somehow the SSR-triggering request is over HTTP... unlikely in this HTTPS setup.
-
-**3. SSR isn't reading cookies from the right place.**
-- In App Router, you must use `cookies()` from `next/headers`. If you try to read `document.cookie` in a server component, it's undefined (no document on server).
-- In Pages Router, read `req.headers.cookie` or `context.req.cookies`.
-- If the code reads from a client-only source, SSR gets undefined.
-
-**4. The fetch from SSR to the backend doesn't forward the cookie.**
-Wait — but this is about SSR reading the cookie, not forwarding. Let me re-read: "ssr can't read it". So SSR can't READ the cookie value at all.
-
-Let me focus. The most likely causes, ranked, for "cookie visibly present in browser but SSR reads undefined":
-
-**A. Path scoping (very likely given the earlier "/home" clue).** Earlier they logged "has cookie true /home". If the cookie was set via `document.cookie` while on the `/home` page without `path=/`, the browser scopes it to `path=/home`. It shows up in devtools (cookies are listed regardless of path), and it's sent on requests to `/home` — but NOT to other paths like `/` or `/dashboard` or wherever SSR for `/user/me` context runs. So SSR on a different path reads no cookie. This fits "/home" appearing in their log AND the cookie being visible but unreadable from SSR elsewhere.
-
-**B. Timing — cookie set client-side after SSR already ran.** SSR on the redirect-landing executed before the client wrote the cookie. You see the cookie now, but the SSR pass that built the header ran cookie-less. On a refresh it might work — unless path scoping (A) also blocks it.
-
-**C. SSR reading from the wrong source** (document.cookie on server, or wrong API). Reads undefined because there's no document server-side.
-
-**D. HttpOnly confusion** — but they said the cookie is set client-side via document.cookie, which can't be HttpOnly, and they can see the JWT in devtools, so it's readable by JS. Not HttpOnly. So this isn't it. Actually wait — if they can see a "valid JWT" in the cookie in devtools, and it's not HttpOnly, then document.cookie can read it client-side. The issue is specifically SERVER-side reading.
-
-Given the earlier "/home" clue, I think **path scoping (A)** is the strongest hypothesis, closely followed by **timing (B)**. Both stem from the same root: the cookie is being set client-side via `document.cookie`, which gives it (1) a default path of the current page and (2) an existence only after client JS runs.
-
-Let me give them the decisive diagnostic:
-
-1. **Check the cookie's Path attribute in devtools.** Application → Cookies → click the cookie → look at the "Path" column. If it's `/home` (or anything other than `/`), that's the bug — SSR on any other path won't receive it.
-
-2. **Check what SSR actually sees in the raw Cookie header.** Log `req.headers.cookie` (Pages) or `cookies().getAll()` (App Router) in SSR and compare to browser. If the cookie name is absent from `req.headers.cookie`, the browser isn't sending it to this path → path/domain scoping. If it's present but your code reads undefined → you're reading from the wrong source.
-
-3. **Confirm where SSR reads from.** App Router needs `cookies()` from next/headers; reading document.cookie server-side = undefined.
-
-The fix for path scoping:
-- When setting the cookie client-side, ALWAYS include `path=/`:
-  ```js
-  document.cookie = `token=${token}; path=/; Secure; SameSite=Lax`;
-  ```
-- Without `path=/`, the cookie defaults to the directory path of the current document.
-
-The fix for timing: have the backend set the cookie directly (Set-Cookie on the redirect), so it exists before any SSR runs, and ideally HttpOnly.
-
-Let me also reconcile the contradiction: earlier they said cookie value was "undefined", now they say it's a valid JWT. Maybe they fixed the param read (guard/match), so now the cookie has a real JWT — and the NEXT layer of the bug surfaced: SSR can't read it. That's a coherent progression. So we've fixed the write, and now we're back to the SSR-read problem, but this time the cookie genuinely has a good value. So the remaining issue is purely: why can't SSR read a present, valid cookie? → path scoping or timing or wrong-source.
-
-Let me write this up concisely. Lead with the key insight: a cookie set client-side via document.cookie has TWO properties that bite SSR — default path scoping and post-SSR timing. Given the "/home" clue, path scoping is the prime suspect.
-
-I want to be concise here. The conversation has been long with detailed responses. The user is clearly technical and we're zeroing in. Let me lead with the decisive check (the Path attribute) and the reasoning, then the fix.
-
-I should not over-format. Let me lead with the insight, give the one decisive check, explain the two mechanisms, and the fix.
-
-Actually let me reconsider whether to lead with path. The "/home" clue is from many messages ago: "has cookie true /home". That strongly suggests the cookie's path is /home, or that the check happened on the /home route. Combined with "cookie set as client-side cookie from URL param" (document.cookie defaults path to current page), path=/home scoping is a very strong, specific, and checkable hypothesis. I'll lead with it but also cover timing and wrong-source since I can't see their code.
-
-Let me write.
-
-Language: English.</thinking>If the cookie holds a valid JWT in the browser but SSR reads `undefined`, you've hit the defining weakness of a **client-side-set cookie**: `document.cookie` writes are invisible to the server in two specific ways, and your earlier `/home` clue points hard at the first one.
-
-**Prime suspect — path scoping. Check this first, it's one click.**
-Devtools → Application → Cookies → click your token cookie → look at the **Path** column.
-
-A cookie set with `document.cookie` defaults its path to *the directory of the page that set it* — not `/`. Your token gets written on `/home` (matching your "has cookie true /home" log), so the browser scopes it to `Path=/home`. The consequence:
-
-- Devtools lists it regardless of path, so it *looks* present. ✓
-- The browser only sends it on requests **under `/home`**. ✗
-- SSR for any other route gets no cookie in `req.headers.cookie` → your read returns `undefined`.
-
-So the cookie is real, valid, and simply **not being transmitted** to the SSR path that needs it. If the Path shows `/home` (or anything but `/`), that's the bug.
-
-**Confirm what SSR actually receives** (don't infer from devtools — log the raw header):
+But confirm it rather than assume — this fixes the read *mechanism*, which isn't necessarily the only thing wrong. Log the result right there:
 
 ```js
-// Pages Router
-console.log('SSR raw cookie header:', req.headers.cookie);
-
-// App Router
-import { cookies } from 'next/headers';
-console.log('SSR cookies:', cookies().getAll().map(c => c.name));
+const cookieStore = await cookies();
+const token = cookieStore.get('token')?.value;
+console.log('SSR token from cache.ts:', token ? `present (${token.slice(0,10)}…)` : 'MISSING');
 ```
 
 ```bash
-kubectl logs -n portal deploy/portal-frontend | grep -i 'SSR'
+kubectl logs -n portal deploy/portal-frontend | grep 'SSR token from cache.ts'
 ```
 
-- **Cookie name absent** from that output → it's not being *sent* → path (or domain) scoping. This is the likely one.
-- **Cookie name present** but your code still reads undefined → you're reading from the **wrong source** (e.g. trying `document.cookie` in a server component — there's no `document` on the server; App Router must use `cookies()` from `next/headers`, Pages must use `req.headers.cookie`).
+Two cautions:
 
-**Fix — set the cookie with an explicit root path:**
+**It does not fix path scoping.** Your earlier `/home` clue still stands. If the cookie was set via `document.cookie` on `/home`, it defaults to `Path=/home`, and the browser won't *send* it to SSR on other routes — so `await cookies()` reads nothing because the cookie isn't in the request at all. The log above is the test: if it's still `MISSING` even though devtools shows a valid JWT, it's scoping, and the fix is adding `path=/` to the cookie write.
 
-```js
-document.cookie = `token=${token}; path=/; Secure; SameSite=Lax`;
-```
+**The file is literally `cache.ts` — mind the cache boundary.** If `await cookies()` sits inside an `unstable_cache` callback (or a `'use cache'` scope), Next.js will error or read nothing: dynamic request data can't be accessed inside the Data Cache, because that cache is shared across requests and users. Cookies must be read in request scope and the token passed *into* the cached function as an argument — never read inside it. And don't cache the `/user/me` response itself keyed on the token in a shared cache, or one user's data leaks to another. React's per-request `cache()` is fine; `unstable_cache` is not, for anything cookie-dependent.
 
-That single missing `path=/` is the most common cause of "visible in browser, invisible to SSR." With it, the cookie rides along on every route and SSR reads it.
-
-**The two other mechanisms to rule out while you're here:**
-
-- **Timing.** A `document.cookie` write only exists *after* the client JS runs. If SSR executed on the redirect-landing request — before that write — it saw nothing, even though the cookie appears now. With `path=/` fixed, a refresh will confirm; if it works on refresh but not on first landing, it's this.
-- **Domain.** If SSR's request resolves to a different subdomain than where the cookie is scoped, it won't be sent. Less likely on same-origin, but check the Domain attribute too.
-
-**The architectural fix that removes all three at once:** have the **backend** set the cookie on its redirect response (`Set-Cookie: token=...; Path=/; HttpOnly; Secure; SameSite=Lax`) instead of passing the token in the URL for client JS to store. Then the cookie exists before any SSR runs (no timing gap), is correctly path-scoped, and — if `HttpOnly` — is readable by SSR via `req.headers.cookie` while being safe from XSS. The only adjustment: with `HttpOnly`, client-side JS can no longer read it, so all token access moves server-side, which for an SSR app is what you want anyway.
-
-Check the Path attribute and paste it back along with the `SSR raw cookie header` output — that'll confirm whether it's scoping (almost certainly) or a read-source mismatch, and the fix is the one-liner above.
+So: if the log shows the token **present**, you're through the read problem — next step is confirming SSR actually forwards it on the axios call to the backend (`headers: { Authorization: \`Bearer ${token}\` }`), since that's the layer where your original `Bearer undefined` was being built. If it's still **missing**, it's path scoping, and `path=/` on the write is the fix.
