@@ -1,21 +1,47 @@
-`await cookies()` is the correct App Router pattern, and it may be a real fix: in Next.js 15 the `cookies()`/`headers()` APIs became **async**. The old synchronous `const cookieStore = cookies()` returns a *pending promise*, so `.get('token')?.value` on it yields `undefined`. If that's what cache.ts was doing, you may have just fixed the read side.
+"Context lost" / "no request" is the decisive symptom, and it's a different bug from everything before: `cookies()` returning empty with *no request context* means the code is running **outside a request scope**. It isn't that the cookie is missing — it's that Next.js has no request to read cookies *from*. This is a code-placement problem, not a cookie problem.
 
-But confirm it rather than assume — this fixes the read *mechanism*, which isn't necessarily the only thing wrong. Log the result right there:
+`cookies()` only works when there's an active request bound to it. It returns empty / throws "context lost" / "called outside a request scope" in exactly these places:
+
+**1. Inside a cache boundary (most likely, given the filename `cache.ts`).** If the `cookies()` call is inside `unstable_cache(...)` or a `'use cache'` function, Next.js deliberately severs request context — the whole point of that cache is to be shared across requests and users, so per-request data like cookies is *forbidden* inside it. That's your "context lost" verbatim. The cookie read must happen **outside** the cache, and the value passed **in**:
 
 ```js
-const cookieStore = await cookies();
-const token = cookieStore.get('token')?.value;
-console.log('SSR token from cache.ts:', token ? `present (${token.slice(0,10)}…)` : 'MISSING');
+// ❌ broken — cookies() inside the cached scope, no request bound
+const getUser = unstable_cache(async () => {
+  const token = (await cookies()).get('token')?.value; // [] empty, context lost
+  return fetchUser(token);
+});
+
+// ✅ read in request scope, pass token in as an argument
+async function getUser() {
+  const token = (await cookies()).get('token')?.value; // request context exists here
+  return cachedFetchUser(token);
+}
+const cachedFetchUser = unstable_cache(
+  async (token) => fetchUser(token),
+  ['user-me'],
+);
 ```
 
-```bash
-kubectl logs -n portal deploy/portal-frontend | grep 'SSR token from cache.ts'
+(Caution: don't key a *shared* cache on a per-user token and cache the `/user/me` body, or you risk serving one user's data to another. For per-user data, prefer React's per-request `cache()` over `unstable_cache`.)
+
+**2. Called at module top-level / import time.** If `cookies()` runs when the module loads rather than inside a function that executes per-request, there's no request yet → empty. It must be *inside* the function that runs during the request, not at file scope.
+
+**3. Called from a Client Component or anything in the client bundle.** `cookies()` is server-only. If `cache.ts` gets imported into a `'use client'` path, there's no server request context → empty.
+
+**4. Called after an `await` that crossed out of the request** (some background task, `setTimeout`, `after()` callback, or a fire-and-forget promise). Less common, but it detaches from the request store.
+
+Given the file is named `cache.ts`, **#1 is overwhelmingly likely** — `cookies()` is being called inside the cached function. The fix is structural: pull the cookie read up into the request-scoped caller, and pass the token down as a parameter. The cache function should be pure with respect to its inputs and never touch `cookies()`/`headers()` directly.
+
+One quick confirmation — add a log at two points:
+
+```js
+// at module top of cache.ts (runs at import)
+console.log('cache.ts module load');
+
+// inside the function, before cookies()
+console.log('about to read cookies, in request?');
 ```
 
-Two cautions:
+If "module load" prints but the cookie read either never runs or runs detached, you'll see the placement clearly in `kubectl logs -n portal deploy/portal-frontend`.
 
-**It does not fix path scoping.** Your earlier `/home` clue still stands. If the cookie was set via `document.cookie` on `/home`, it defaults to `Path=/home`, and the browser won't *send* it to SSR on other routes — so `await cookies()` reads nothing because the cookie isn't in the request at all. The log above is the test: if it's still `MISSING` even though devtools shows a valid JWT, it's scoping, and the fix is adding `path=/` to the cookie write.
-
-**The file is literally `cache.ts` — mind the cache boundary.** If `await cookies()` sits inside an `unstable_cache` callback (or a `'use cache'` scope), Next.js will error or read nothing: dynamic request data can't be accessed inside the Data Cache, because that cache is shared across requests and users. Cookies must be read in request scope and the token passed *into* the cached function as an argument — never read inside it. And don't cache the `/user/me` response itself keyed on the token in a shared cache, or one user's data leaks to another. React's per-request `cache()` is fine; `unstable_cache` is not, for anything cookie-dependent.
-
-So: if the log shows the token **present**, you're through the read problem — next step is confirming SSR actually forwards it on the axios call to the backend (`headers: { Authorization: \`Bearer ${token}\` }`), since that's the layer where your original `Bearer undefined` was being built. If it's still **missing**, it's path scoping, and `path=/` on the write is the fix.
+Show me the function in cache.ts that wraps the `cookies()` call — specifically whether it's inside `unstable_cache`/`'use cache'` or called at top level — and I'll give you the exact restructure.
