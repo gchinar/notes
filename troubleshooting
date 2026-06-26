@@ -1,134 +1,46 @@
-Short answer: **no — not for the core bug.** You can paper over symptoms at the K8s layer, but the thing that's actually broken is *inside your app's process* (a singleton interceptor reaching into per-request `AsyncLocalStorage`), and nothing in a Deployment manifest can reach inside the Node process to fix where a function reads its context. K8s controls *around* the container — replicas, env, networking, resources — it does not control *how your code propagates request scope*. So Bug 1 is uncloseable from the cluster. Two of the contributing factors, though, *are* partly addressable at the deployment level, with real caveats. Let me separate what's possible from what isn't.
+A `400` is the most informative result you've gotten — it flips the whole diagnosis. Walk through what it rules out, because each elimination is solid:
 
-**Bug 1 (interceptor context loss) — not fixable in K8s. At best, hideable, and even the hide is bad.**
-The only deployment-level lever that touches it is replica count: scale to `replicas: 1` and pin concurrency, and you'd *reduce* the race the way dev does. But that:
+- **No TLS error, no timeout** → the SSR-to-external-URL network/TLS trap (Bug 2a) is **dead**. The hairpin isn't your problem. The internal-URL change is still worth keeping for latency, but it won't fix this.
+- **Backend reachable, returns `400`** → the request arrived and the backend *processed* it enough to reject it as malformed. A `400` is not an auth failure (`401`/`403`) and not a server crash (`500`). It's **"I got your request and it's badly formed."**
+- **Valid token in hand** → so it's not the token's *validity*. The token is fine; something about how the request is *shaped* is wrong.
 
-- doesn't eliminate it (a single pod still serves concurrent requests; Node is one process handling many in flight — the race is intra-process, not just cross-pod),
-- throws away horizontal scaling and HA in staging/prod, and
-- is the classic "works because load is low" trap that detonates later.
+That combination — reachable, valid token, `400 Bad Request` — points away from auth entirely and toward **the request the SSR axios call is actually constructing**. The backend is reading something in the request it doesn't like. The job now is to see the *backend's reason* for the 400 and the *exact request* SSR sent, because "400" alone is as generic as "something went wrong" was.
 
-It treats a correctness bug as a capacity setting. The real fix (read in request scope / middleware injection — which you've already done) is the only thing that actually closes it, and it's free and platform-independent.
+**Get the backend's 400 reason first — it usually says exactly what's malformed:**
 
-**Bug 2a (SSR → external ALB hairpin) — this one genuinely *can* be steered at the K8s/infra level.** This is networking, which is K8s's domain. Options, roughly in order of cleanliness:
+```bash
+kubectl logs -n portal deploy/portal-backend --tail=100 -f | grep -iE '400|bad request|malformed|missing|header|required|validation'
+```
 
-1. **Point the server-side `baseURL` at the in-cluster Service via env in the Deployment.** This is the right-sized fix and it *is* a manifest change — you're not changing code, just configuration the code reads:
-   ```yaml
-   env:
-     - name: INTERNAL_API_URL
-       value: "http://portal-backend.portal.svc.cluster.local:8080"
-   ```
-   (Your code still needs to *read* `INTERNAL_API_URL` for server calls and keep the public URL for the browser — so it's a joint config+code split, but the value lives in the manifest.)
-
-2. **CoreDNS rewrite / hostAliases** so the public hostname resolves to the internal Service from inside the pod — avoids the ALB round-trip without changing the URL. Pure infra, but indirect and easy to forget later.
-
-3. **Fix the TLS trust** if you'd rather keep the hairpin: mount the ACM/CA chain into the pod so Node's strict validation passes — a `volumeMounts` + `NODE_EXTRA_CA_CERTS` env change, entirely in the manifest:
-   ```yaml
-   env:
-     - name: NODE_EXTRA_CA_CERTS
-       value: /etc/ssl/certs/ca-bundle.crt
-   ```
-   This removes the TLS *failure* but keeps the pointless pod→ALB→pod detour and its latency. Treats the symptom, not the waste.
-
-**Build mode (`next dev` vs `next start`) — this is your image/CI, which is deployment-adjacent.** Making EKS behave like dev would mean shipping a dev build, which you should not do (slower, unoptimized, and it only "fixes" things by hiding the same race). The correct direction is the opposite: run the production build in dev so you *reproduce* the bug, not suppress it.
-
-So the honest split: **the networking piece (Bug 2a) is legitimately a Deployment/infra fix** — env var for the internal URL, or DNS rewrite, or CA trust — and any of those is reasonable. **The context-loss piece (Bug 1) is not** — there is no manifest that makes a singleton interceptor request-scope-safe; only the code change does, and you've already made it. The danger in trying to solve everything at the K8s layer is that the only K8s "fix" for Bug 1 is `replicas: 1`, which doesn't actually fix it and costs you scaling — you'd be trading a correct, free code fix for a fragile, expensive infrastructure constraint.
-
-Since your middleware change already closed Bug 1, the *only* thing left worth doing at the deployment level is Bug 2a — and option 1 (internal Service URL via env) is the clean one. Want the full Deployment snippet wiring `INTERNAL_API_URL` to the in-cluster Service, plus the one-line config split so server calls use it and browser calls keep the public host?
-
-Here's the complete wiring. The split works cleanly because of one Next.js fact you have to respect, so let me put that front and center — it's the thing that makes or breaks this.
-
-**The critical distinction: one var is runtime, the other is build-time.**
-
-- `INTERNAL_API_URL` (no prefix) → read at **runtime** from the container's env → you set it in the **Deployment**. ✅ This is the one you asked for.
-- `NEXT_PUBLIC_API_URL` (the public host, for the browser) → **inlined at build time** by `next build` into the JS bundle. Setting it in the Deployment env does **nothing** for the browser — it's already baked in. It must be a **Docker build ARG / CI env** at image-build time.
-
-If you set `NEXT_PUBLIC_*` in the Deployment expecting the browser to pick it up and it "doesn't work," that's why. Server var → manifest; public var → build.
-
-**1. The config split (code).** A tiny helper that picks the URL by execution context:
+**Then log the full outgoing request shape from SSR** (the body is generic; the request isn't):
 
 ```ts
-// lib/api-base.ts
-export function getApiBaseUrl(): string {
-  if (typeof window === 'undefined') {
-    // SERVER (SSR, Server Components, cache.ts): call the backend
-    // directly inside the cluster — no ALB hairpin, no public TLS
-    return process.env.INTERNAL_API_URL ?? process.env.NEXT_PUBLIC_API_URL!;
-  }
-  // BROWSER: must go through the public ALB host (build-time inlined)
-  return process.env.NEXT_PUBLIC_API_URL!;
+} catch (err: any) {
+  console.error('[user/me] 400 DEBUG', {
+    url: err.config?.baseURL + err.config?.url,
+    method: err.config?.method,
+    reqHeaders: err.config?.headers,        // ← what did SSR actually send?
+    respStatus: err.response?.status,
+    respBody: JSON.stringify(err.response?.data)?.slice(0, 400), // ← backend's reason
+  });
+  throw err;
 }
 ```
 
-```ts
-// lib/api-client.ts
-import axios from 'axios';
-import { getApiBaseUrl } from './api-base';
+Here are the usual causes of a `400` on an authenticated SSR call, ranked for your situation — the first two are most likely given everything upstream is now correct:
 
-export const apiClient = axios.create({ baseURL: getApiBaseUrl() });
-```
+**1. A malformed `Authorization` header — the token is valid but the *header* is wrong.** This is the subtle one and it fits perfectly: valid token, but the way it's attached breaks. Common forms:
+- **Double `Bearer`:** `Authorization: Bearer Bearer eyJ...`. If your `x-token` already contains `Bearer ` (you set `authorization` in middleware *and* re-wrap with `` `Bearer ${token}` `` in the axios call), you get two. Some backends 400 a malformed scheme rather than 401.
+- **Stray prefix/whitespace/newline:** the token picked up a `\n`, a quote, or URL-encoding (`%20`, `%2E`) from the cookie→URL→header journey. A header value with an illegal character → 400.
+- **Wrong header name the backend strictly requires** (e.g. it wants `Authorization` but got only `x-token`, or vice versa).
+Check `reqHeaders` in the log: is `Authorization` exactly `Bearer eyJ...` with one `Bearer`, no quotes, no trailing whitespace?
 
-A module-level singleton is fine here (unlike the token): server and client are separate bundles, each evaluates `typeof window` in its own runtime, so each resolves to the correct URL. The fallback means "forgot to set `INTERNAL_API_URL`" silently reverts to the hairpin — safe from crashing, but log a warning if you want it loud.
+**2. A required header the ALB *used to add* that's now missing.** This is the EKS-specific twist and a strong candidate: when you call the **external** URL, the request still goes through the ALB, which may inject headers (`X-Forwarded-*`, host, or OIDC headers) the backend requires. But you're testing from inside the pod with `curl` — *that* request may skip some of them, and your SSR call may differ from the browser's. If the backend validates a header the browser-path ALB normally supplies and SSR doesn't, → 400. Compare the headers in a browser request (devtools) vs your SSR `reqHeaders` — what's present in one and missing in the other?
 
-**2. The Deployment env (runtime, server-only).** Note the scheme is `http`, not `https` — inside the cluster you hit the Service directly; TLS was terminated at the ALB, so this hop has no cert to validate. That's what kills the `CERT_*` / `UNABLE_TO_VERIFY_LEAF_SIGNATURE` class of errors:
+**3. A malformed or missing `Host` / content header.** SSR axios may send a `Host` the backend's host-validation rejects, or a `Content-Type`/`Accept` it requires for `/user/me`. Less likely for a GET, but visible in `reqHeaders`.
 
-```yaml
-# base/deployment.yaml (the relevant container env)
-spec:
-  template:
-    spec:
-      containers:
-        - name: portal-frontend
-          env:
-            - name: INTERNAL_API_URL
-              value: "http://portal-backend.portal.svc.cluster.local:8080/api"
-```
+**4. The backend genuinely wants a body/param SSR isn't sending** — a query param or header `/user/me` requires that the browser path includes and SSR omits.
 
-**3. Kustomize overlay (your GitOps reality).** The value is cluster-specific, so it belongs in the STG overlay, not base. Keep base generic and patch it:
+Given the path you've traveled — token now reliably attached via middleware, then re-wrapped in the axios call — **cause 1 (double `Bearer` or a malformed header value) is the most probable.** That's the exact kind of bug the middleware→axios handoff introduces: middleware sets the header one way, the call wraps it again. The `reqHeaders` dump shows it in one glance.
 
-```yaml
-# overlays/stg/patch-frontend-env.yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: portal-frontend
-spec:
-  template:
-    spec:
-      containers:
-        - name: portal-frontend
-          env:
-            - name: INTERNAL_API_URL
-              value: "http://portal-backend.portal.svc.cluster.local:8080/api"
-```
-
-```yaml
-# overlays/stg/kustomization.yaml
-resources:
-  - ../../base
-patches:
-  - path: patch-frontend-env.yaml
-```
-
-Since ArgoCD watches the STG branch, the rollout is: commit this to STG → ArgoCD syncs. No `kubectl apply`. (Alternatively, a `configMapGenerator` + `valueFrom.configMapKeyRef` keeps env values out of the Deployment spec — cleaner if you have many vars, but the inline patch is simplest for one.)
-
-**Two things you must verify — the FQDN bypasses the ingress, so anything the ALB was doing to the request no longer applies:**
-
-**a) The path prefix.** Your old URL ended in `/api`. That `/api` might have been an **ALB ingress path rule** routing to the backend — in which case the backend serves `/user/me` *natively* and the internal URL should have **no** `/api`. Or the backend genuinely serves under `/api`. The internal Service URL skips the ingress entirely, so you must match the backend's *actual* listening path. Test both from inside a pod and keep whichever returns sanely (401/200, not 404):
-
-```bash
-kubectl exec -n portal deploy/portal-frontend -- sh -c \
-  "curl -s -o /dev/null -w 'with /api: %{http_code}\n' http://portal-backend.portal.svc.cluster.local:8080/api/user/me"
-kubectl exec -n portal deploy/portal-frontend -- sh -c \
-  "curl -s -o /dev/null -w 'no /api:   %{http_code}\n' http://portal-backend.portal.svc.cluster.local:8080/user/me"
-```
-
-**b) The Service name and port.** The `:8080` in the FQDN is the **Service** `port` (not necessarily the container port). Confirm the real name/port:
-
-```bash
-kubectl get svc -n portal portal-backend -o jsonpath='{.metadata.name}:{.spec.ports[*].port}{"\n"}'
-```
-
-Adjust the FQDN to match. The format is always `<service>.<namespace>.svc.cluster.local:<service-port>` (you can shorten to `portal-backend.portal` or just `portal-backend` from within the same namespace).
-
-Once this is in and the path/port verified, re-run the `REAL ERROR` log. If 2a was your failure, the `code: CERT_*/ECONNREFUSED` disappears and you'll either get clean `200`s or fall through to 2b/2c (`401/403` or `500`) — which, if they show up, are the token-claims or backend-logic fixes, not this one.
-
+Paste two things — the backend's 400 `respBody`/log line, and the SSR `reqHeaders` (redact the token value but keep the **scheme and structure**, i.e. show `Bearer eyJ…` vs `Bearer Bearer eyJ…` vs quoted/whitespace) — and that pins it precisely. My bet is you'll see a doubled `Bearer` or an encoded character in the header.
