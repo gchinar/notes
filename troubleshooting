@@ -1,46 +1,15 @@
-A `400` is the most informative result you've gotten — it flips the whole diagnosis. Walk through what it rules out, because each elimination is solid:
+Fix **Bug 2 first** — and the ordering isn't a toss-up, it follows from one fact: Bug 2 is *consistent* and fires *with a valid token*. That means it sits **downstream** of Bug 1 and is independent of it. A consistent failure on the happy path is the harder wall — even if you perfected Bug 1 so the token arrived 100% of the time, every one of those calls would still hit the 400. So Bug 1 can't unblock anything; Bug 2 is what's actually keeping `/user/me` from ever succeeding.
 
-- **No TLS error, no timeout** → the SSR-to-external-URL network/TLS trap (Bug 2a) is **dead**. The hairpin isn't your problem. The internal-URL change is still worth keeping for latency, but it won't fix this.
-- **Backend reachable, returns `400`** → the request arrived and the backend *processed* it enough to reject it as malformed. A `400` is not an auth failure (`401`/`403`) and not a server crash (`500`). It's **"I got your request and it's badly formed."**
-- **Valid token in hand** → so it's not the token's *validity*. The token is fine; something about how the request is *shaped* is wrong.
+The reasoning, laid out:
 
-That combination — reachable, valid token, `400 Bad Request` — points away from auth entirely and toward **the request the SSR axios call is actually constructing**. The backend is reading something in the request it doesn't like. The job now is to see the *backend's reason* for the 400 and the *exact request* SSR sent, because "400" alone is as generic as "something went wrong" was.
+**1. Bug 2 blocks the success path; Bug 1 only blocks *some attempts at* the path.** Right now your best-case request — token present, context intact — still fails. Until that best case works, you have *no* working path to protect or stabilize. Fixing Bug 1 first just means more requests reach a wall that still stops them. You'd be improving delivery to a dead end.
 
-**Get the backend's 400 reason first — it usually says exactly what's malformed:**
+**2. Bug 2 is consistent, so it's far cheaper to fix.** Consistent bugs are deterministic: reproduce, inspect, fix, verify in one loop. Bug 1 is intermittent — a race — which is the most expensive kind to *verify* a fix for, because "it worked a few times" doesn't prove anything. You don't want to be debugging a flaky race while a deterministic 400 is also corrupting your signal.
 
-```bash
-kubectl logs -n portal deploy/portal-backend --tail=100 -f | grep -iE '400|bad request|malformed|missing|header|required|validation'
-```
+**3. They'd contaminate each other's diagnosis if done in the wrong order.** This is the practical trap. Your logs already show both: `x-token MISSING` lines (Bug 1) *and* a 400 with the token present (Bug 2). If you attack Bug 1 first, you can't cleanly tell whether a remaining failure is "token didn't arrive" or "token arrived and got 400'd" — the two symptoms blur. Fixing the consistent one first gives you a **clean success on the happy path**, which becomes your reference: once a token-present call returns 200, *any* remaining failure is unambiguously Bug 1 (token absence), and you can chase the race against a known-good baseline.
 
-**Then log the full outgoing request shape from SSR** (the body is generic; the request isn't):
+**4. Bug 2 is likely one line.** Your trace points hard at a doubled `Bearer` — middleware sets the header and the axios call wraps it again. That's a single-line fix (set the full `Authorization` value in one place, not both). It's a poor trade to defer a one-line deterministic fix to first untangle a concurrency race.
 
-```ts
-} catch (err: any) {
-  console.error('[user/me] 400 DEBUG', {
-    url: err.config?.baseURL + err.config?.url,
-    method: err.config?.method,
-    reqHeaders: err.config?.headers,        // ← what did SSR actually send?
-    respStatus: err.response?.status,
-    respBody: JSON.stringify(err.response?.data)?.slice(0, 400), // ← backend's reason
-  });
-  throw err;
-}
-```
+One caveat so this doesn't bite you: confirm the two are truly independent before you commit to the order. The way to be sure is the header dump on a request where context *is* present (your replay shows these exist). If that request shows `Bearer Bearer …` and 400s, Bug 2 is genuinely standalone — fix it. The only scenario where the order flips is if Bug 2 turns out to be *caused by* Bug 1 — e.g. the 400 is actually `Bearer undefined` stringified, not a double Bearer. But you've already established the token is valid and present on the failing calls, so that's ruled out. They're separate, and Bug 2 is downstream.
 
-Here are the usual causes of a `400` on an authenticated SSR call, ranked for your situation — the first two are most likely given everything upstream is now correct:
-
-**1. A malformed `Authorization` header — the token is valid but the *header* is wrong.** This is the subtle one and it fits perfectly: valid token, but the way it's attached breaks. Common forms:
-- **Double `Bearer`:** `Authorization: Bearer Bearer eyJ...`. If your `x-token` already contains `Bearer ` (you set `authorization` in middleware *and* re-wrap with `` `Bearer ${token}` `` in the axios call), you get two. Some backends 400 a malformed scheme rather than 401.
-- **Stray prefix/whitespace/newline:** the token picked up a `\n`, a quote, or URL-encoding (`%20`, `%2E`) from the cookie→URL→header journey. A header value with an illegal character → 400.
-- **Wrong header name the backend strictly requires** (e.g. it wants `Authorization` but got only `x-token`, or vice versa).
-Check `reqHeaders` in the log: is `Authorization` exactly `Bearer eyJ...` with one `Bearer`, no quotes, no trailing whitespace?
-
-**2. A required header the ALB *used to add* that's now missing.** This is the EKS-specific twist and a strong candidate: when you call the **external** URL, the request still goes through the ALB, which may inject headers (`X-Forwarded-*`, host, or OIDC headers) the backend requires. But you're testing from inside the pod with `curl` — *that* request may skip some of them, and your SSR call may differ from the browser's. If the backend validates a header the browser-path ALB normally supplies and SSR doesn't, → 400. Compare the headers in a browser request (devtools) vs your SSR `reqHeaders` — what's present in one and missing in the other?
-
-**3. A malformed or missing `Host` / content header.** SSR axios may send a `Host` the backend's host-validation rejects, or a `Content-Type`/`Accept` it requires for `/user/me`. Less likely for a GET, but visible in `reqHeaders`.
-
-**4. The backend genuinely wants a body/param SSR isn't sending** — a query param or header `/user/me` requires that the browser path includes and SSR omits.
-
-Given the path you've traveled — token now reliably attached via middleware, then re-wrapped in the axios call — **cause 1 (double `Bearer` or a malformed header value) is the most probable.** That's the exact kind of bug the middleware→axios handoff introduces: middleware sets the header one way, the call wraps it again. The `reqHeaders` dump shows it in one glance.
-
-Paste two things — the backend's 400 `respBody`/log line, and the SSR `reqHeaders` (redact the token value but keep the **scheme and structure**, i.e. show `Bearer eyJ…` vs `Bearer Bearer eyJ…` vs quoted/whitespace) — and that pins it precisely. My bet is you'll see a doubled `Bearer` or an encoded character in the header.
+So: **Bug 2 now** (get one clean 200 with a valid token — likely the double-`Bearer` one-liner), then **Bug 1** (harden the intermittent context against that green baseline). Bonus: the architectural fix for Bug 1 — token read in request scope via middleware `x-token`, passed explicitly — is exactly what makes the Bug 2 header construction simpler too, so doing Bug 2 first also tells you the cleanest single place to set `Authorization` when you finalize Bug 1.
