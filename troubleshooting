@@ -1,58 +1,42 @@
-Yes — and this is the right architectural instinct. Middleware *always* runs in request scope with guaranteed access to `request.cookies`, so reading the token there and forwarding it as a header sidesteps the entire intermittent-context problem from Bug 1: your downstream code stops calling `cookies()` from the detached interceptor and instead reads a plain header that's reliably present on every request. This is a clean fix for the context loss.
+Read that log top-to-bottom — it's telling you Bug 1 is **fixed** and you're now looking purely at Bug 2. The two halves split exactly at the error line:
 
-Two things matter for it to actually work, and the second is the one people miss:
+- **Before the error:** middleware has context, and *both* server-component reads show `x-token present`. The token is reliably reaching your data layer. That's the intermittent-context problem solved — the header-injection approach worked.
+- **The error fires while the token is present.** So whatever "something went wrong" is, it is **not** a missing token. This is Bug 2, full stop.
+- **The two `x-token: MISSING` after the error are almost certainly a red herring** — retries or fallback re-renders triggered *by* the error, running on a path that didn't go through middleware (error boundaries, an error-page render, or a client-side retry). They're a *consequence* of the failure, not its cause. Don't chase them; fix the thing that threw while the token was present, and they'll stop.
 
-**1. You must rebuild the request headers and pass them through `NextResponse.next()` — exactly the change in your step 3.** The default `NextResponse.next()` does *not* forward modified request headers to the downstream handler. You have to clone the incoming headers, add yours, and hand them back via the `request.headers` option:
+So the diagnosis is locked: **a call fails with a valid token in hand.** That means the failure is downstream of auth entirely. But you still can't see *why*, because "something went wrong" is a swallowed error. That generic string is now the only thing standing between you and the fix. You have to unmask it.
+
+Put the real error on the actual failing call — and critically, log it at the point of the axios failure, not at the page's outer catch where it's already been generalized:
 
 ```ts
-// middleware.ts
-import { NextResponse } from 'next/server';
-import type { NextRequest } from 'next/server';
-
-export function middleware(request: NextRequest) {
-  const token = request.cookies.get('token')?.value;
-
-  // clone incoming headers and inject the token
-  const requestHeaders = new Headers(request.headers);
-  if (token) {
-    requestHeaders.set('x-token', token);
-  }
-
-  // forward the MODIFIED request headers downstream
-  return NextResponse.next({
-    request: { headers: requestHeaders },
+try {
+  const res = await apiClient.get('/user/me', {
+    headers: { Authorization: `Bearer ${token}` },
   });
+  return res.data;
+} catch (err: any) {
+  console.error('[user/me] REAL ERROR', {
+    tokenPresent: !!token,
+    status: err.response?.status,        // 401 / 403 / 500 / undefined
+    code: err.code,                      // ECONNREFUSED / ETIMEDOUT / EPROTO / DEPTH_ZERO_SELF_SIGNED_CERT / UNABLE_TO_VERIFY_LEAF_SIGNATURE ...
+    body: JSON.stringify(err.response?.data)?.slice(0, 300),
+    url: err.config?.baseURL + err.config?.url,
+    message: err.message,
+  });
+  throw err;
 }
-
-export const config = {
-  matcher: ['/((?!_next/static|_next/image|favicon.ico).*)'],
-};
 ```
 
-Your three steps map onto this directly — the only correction is mechanical: don't build a separate `res` and also call `next()`; the header forwarding *is* the response. `NextResponse.next({ request: { headers } })` returns the response that carries your modified request downstream. One return, not two.
-
-**2. Downstream, read the header — but mind the surface.** In a Server Component or route handler, the injected header is now reliably available:
-
-```ts
-import { headers } from 'next/headers';
-const token = (await headers()).get('x-token');   // present on every request, no context gamble
+```bash
+kubectl logs -n portal deploy/portal-frontend | grep -A8 'user/me] REAL ERROR'
 ```
 
-Important: middleware's injected request headers are visible to **Server Components, route handlers, and `getServerSideProps`** — but they are *not* readable from an axios *response/request interceptor* on a shared singleton, for the same reason `cookies()` wasn't. So this only fixes Bug 1 if your data layer reads `x-token` via `headers()` in request scope and passes it onto the axios call explicitly. If the interceptor stays and tries to read context itself, you've just renamed the problem. Read it in the Server Component, pass it as `Authorization` on the call:
+The `status` vs `code` distinction decides everything, and given your setup these are the live possibilities — in order of likelihood now:
 
-```ts
-const token = (await headers()).get('x-token');
-const res = await apiClient.get('/user/me', {
-  headers: { Authorization: `Bearer ${token}` },
-});
-```
+**1. No `status`, but a `code` like `ECONNREFUSED` / `ETIMEDOUT` / `EPROTO` / `CERT_*` → the SSR-to-external-URL trap, the most likely culprit here.** Your `baseURL` is the public `https://api.stg.portal.mycompany.com/api`. From the browser that's fine, but your server component is *also* using it, so SSR sends the request out of the pod, to the ALB, and back. That hairpin fails on things the browser never sees: Node validating the full TLS chain more strictly than a browser (ACM intermediate not in Node's trust path → `UNABLE_TO_VERIFY_LEAF_SIGNATURE`), DNS/routing for the external name from inside the cluster, or timeouts. It can present intermittently, which fits. Fix: SSR should call the backend by its **in-cluster address** — `http://portal-backend.portal.svc.cluster.local:<port>` — not the public hostname. Split your config: external base URL for client, internal service URL for server.
 
-A few cautions worth building in now:
+**2. `status: 401/403`, `tokenPresent: true` → backend rejects a real token.** Back to the claims: `aud`, `iss`, `exp`. The JWT is valid in shape but the backend's expected audience/issuer doesn't match what minted it, or it's expired. Decode the token's payload and compare those three claims to what the backend validates.
 
-- **Guard the missing-token case.** If there's no cookie, don't set the header — and decide the behavior deliberately: either let it through (and let the page redirect to login) or redirect from middleware itself (`NextResponse.redirect(new URL('/login', request.url))`). Don't let a missing token silently become `x-token: undefined` again.
-- **Header injection is per-request, so it sidesteps the cross-request contamination risk** of the singleton interceptor — good. Keep it that way; don't cache the token anywhere module-level.
-- **Don't leak the token outward.** You're setting it on the *request* headers (inward, to your own handlers), which is correct. Don't set it on the *response* headers — that would send the JWT back to the browser in a readable response header.
-- **Runtime/version.** Header forwarding via `next({ request: { headers } })` is stable in current Next; just confirm you're not on an old version where the option behaved differently. Also note middleware runs on the Edge runtime by default — `request.cookies.get()` works there, but any Node-only code you add won't.
-- **Naming.** `x-token` is fine; just be consistent. If you'd rather, set `authorization` directly (`requestHeaders.set('authorization', \`Bearer ${token}\`)`) so downstream reads a standard header and you skip re-wrapping it in `Bearer` later.
+**3. `status: 500`, `tokenPresent: true` → the backend authenticated fine and then *its own* logic threw.** User-not-found, a role/permission check, or a downstream dependency (Aurora MySQL, Valkey). The error is now on the backend side — `kubectl logs -n portal deploy/portal-backend | grep -i 'user/me'` and read its stack for that request.
 
-This does **not** touch Bug 2. Once the token reliably reaches the backend via this path, you'll still need the bucketed error log to resolve the "valid token but error" case — that one is either backend token rejection (`aud`/`iss`), the SSR-to-external-URL network/TLS trap, or a 500 in the endpoint, and the header change won't address any of those. But for Bug 1, yes: this is the correct, reliable fix. Make the one correction (single return through `next({ request: { headers } })`, not a separate `res` plus `next()`), read `x-token` via `headers()` in request scope, and the intermittent context loss goes away.
+You're one log line from the answer. The token problem is behind you; paste the `REAL ERROR` output and the bucket it lands in — `code` (network/TLS), `401/403` (token rejected), or `500` (backend logic) — names the exact fix, and they're genuinely different fixes so it's worth seeing rather than guessing.
