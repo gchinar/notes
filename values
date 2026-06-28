@@ -1,135 +1,14 @@
-# =============================================================================
-# Langfuse v3 — staging values (arm64 / EKS / ArgoCD)
-# =============================================================================
-# WHAT CHANGED vs the previous version:
-#   1. NEXTAUTH_URL is now set via `langfuse.nextauth.url` (NOT additionalEnv).
-#      The chart always emits its own NEXTAUTH_URL from this key, so setting it
-#      again in additionalEnv produced a DUPLICATE env entry -> patch error.
-#   2. web/worker images now point at your ECR (arm64 multi-arch mirrors).
-#   3. All datastore subcharts stay deploy:false (you run them in-cluster /
-#      via your S3); only multi-arch images ever run on the Graviton nodes.
-# Replace every  >>> EDIT  placeholder.
-# =============================================================================
+            # CORS for browser calls from the frontend origin
+            add_header 'Access-Control-Allow-Origin' 'https://....com' always;
+            add_header 'Access-Control-Allow-Credentials' 'true' always;
+            add_header 'Access-Control-Allow-Headers' 'Authorization, Content-Type' always;
+            add_header 'Access-Control-Allow-Methods' 'GET, POST, PUT, DELETE, OPTIONS' always;
 
-langfuse:
-  # ---- required app secrets (from the Secret you created) --------------------
-  # >>> EDIT: secret name must match the Secret in namespace `aidata`
-  salt:
-    secretKeyRef:
-      name: langfuse-poc-secrets
-      key: salt
-  encryptionKey:
-    secretKeyRef:
-      name: langfuse-poc-secrets
-      key: encryption-key
-
-  # ---- NextAuth (THE FIX) ----------------------------------------------------
-  nextauth:
-    # >>> EDIT: must EXACTLY match the ingress host below — https, no trailing slash
-    url: "https://langfuse-stg.example.com"
-    secret:
-      secretKeyRef:
-        name: langfuse-poc-secrets
-        key: nextauth-secret
-  # NOTE: do NOT also put NEXTAUTH_URL under additionalEnv — that is what caused
-  # the duplicate-key patch error.
-  additionalEnv: []
-
-  # ---- scheduling: pin everything to arm64 -----------------------------------
-  nodeSelector:
-    kubernetes.io/arch: arm64
-
-  # ---- IRSA: gives web + worker scoped S3 access with no static keys ---------
-  serviceAccount:
-    create: true
-    annotations:
-      # >>> EDIT: the IRSA role ARN you created (S3 access to the two prefixes)
-      eks.amazonaws.com/role-arn: "arn:aws:iam::<ACCOUNT_ID>:role/langfuse-stg-s3"
-
-  # ---- images: pull from ECR (arm64 mirrors) ---------------------------------
-  web:
-    image:
-      # >>> EDIT: your ECR registry
-      repository: "<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/langfuse"
-      tag: "3"        # pin a concrete tag, not "latest"
-  worker:
-    image:
-      # >>> EDIT
-      repository: "<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/langfuse-worker"
-      tag: "3"
-
-  # ---- ingress: ALB + ACM (HTTPS) --------------------------------------------
-  ingress:
-    enabled: true
-    className: alb
-    annotations:
-      alb.ingress.kubernetes.io/scheme: internal            # >>> EDIT: or internet-facing
-      alb.ingress.kubernetes.io/target-type: ip
-      alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
-      alb.ingress.kubernetes.io/healthcheck-path: /api/public/health
-      # >>> EDIT: your ACM certificate ARN
-      alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:<REGION>:<ACCOUNT_ID>:certificate/<CERT_ID>"
-    hosts:
-      # >>> EDIT: same host as nextauth.url above
-      - host: "langfuse-stg.example.com"
-        paths:
-          - path: /
-            pathType: Prefix
-
-# =============================================================================
-# Datastores — all subcharts OFF. Langfuse connects to the Services you deploy
-# in-cluster (postgres/clickhouse/valkey) and to your real S3 bucket.
-# =============================================================================
-
-# ---- PostgreSQL (in-cluster StatefulSet you run; chart does NOT deploy it) ----
-postgresql:
-  deploy: false
-  host: "postgres.aidata.svc.cluster.local"
-  port: 5432
-  auth:
-    username: postgres
-    existingSecret: langfuse-poc-secrets
-    secretKeys:
-      userPasswordKey: postgres-password
-      adminPasswordKey: postgres-password
-    database: postgres_langfuse
-
-# ---- ClickHouse (in-cluster, official image; chart does NOT deploy it) --------
-clickhouse:
-  deploy: false
-  host: "clickhouse.aidata.svc.cluster.local"
-  httpPort: 8123
-  nativePort: 9000
-  database: default
-  clusterEnabled: false          # CRITICAL: single node -> no ON CLUSTER
-  auth:
-    username: default
-    existingSecret: langfuse-poc-secrets
-    existingSecretKey: clickhouse-password
-  migration:
-    url: "clickhouse://clickhouse.aidata.svc.cluster.local:9000"
-    autoMigrate: true
-
-# ---- Redis / Valkey (in-cluster, passwordless POC; chart does NOT deploy it) --
-redis:
-  deploy: false
-  host: "valkey.aidata.svc.cluster.local"
-  port: 6379
-  auth:
-    username: null               # passwordless valkey for the POC
-    password: null               # if your valkey sets a password, use existingSecret instead
-  # Reminder: your valkey.yaml must run with `--maxmemory-policy noeviction`.
-
-# ---- S3 (your EXISTING bucket via IRSA; chart does NOT deploy MinIO) ----------
-s3:
-  deploy: false
-  # >>> EDIT: your bucket + region
-  bucket: "my-langfuse-stg-bucket"
-  region: "<REGION>"
-  forcePathStyle: false
-  # Leave accessKeyId/secretAccessKey EMPTY -> the AWS SDK uses the IRSA role.
-  eventUpload:
-    prefix: "langfuse-events/"
-  mediaUpload:
-    enabled: true
-    prefix: "langfuse-media/"
+            if ($request_method = OPTIONS) {
+                add_header 'Access-Control-Allow-Origin' 'https://...' always;
+                add_header 'Access-Control-Allow-Credentials' 'true' always;
+                add_header 'Access-Control-Allow-Headers' 'Authorization, Content-Type' always;
+                add_header 'Access-Control-Allow-Methods' 'GET, POST, PUT, DELETE, OPTIONS' always;
+                add_header 'Content-Length' 0;
+                return 204;
+            }
