@@ -1,15 +1,11 @@
-Fix **Bug 2 first** — and the ordering isn't a toss-up, it follows from one fact: Bug 2 is *consistent* and fires *with a valid token*. That means it sits **downstream** of Bug 1 and is independent of it. A consistent failure on the happy path is the harder wall — even if you perfected Bug 1 so the token arrived 100% of the time, every one of those calls would still hit the 400. So Bug 1 can't unblock anything; Bug 2 is what's actually keeping `/user/me` from ever succeeding.
+Two things:
 
-The reasoning, laid out:
+**1. The JWT claims.** Decode the `token` cookie value (paste it at jwt.io, or `echo PASTE | cut -d. -f2 | base64 -d`). Send me the **`aud`, `iss`, and `exp`** fields. Redact the values if you want — I just need to see what they are.
 
-**1. Bug 2 blocks the success path; Bug 1 only blocks *some attempts at* the path.** Right now your best-case request — token present, context intact — still fails. Until that best case works, you have *no* working path to protect or stabilize. Fixing Bug 1 first just means more requests reach a wall that still stops them. You'd be improving delivery to a dead end.
+**2. The backend's rejection reason.** Logs from the backend pod for the `/user/me` call that now arrives with the Bearer token:
 
-**2. Bug 2 is consistent, so it's far cheaper to fix.** Consistent bugs are deterministic: reproduce, inspect, fix, verify in one loop. Bug 1 is intermittent — a race — which is the most expensive kind to *verify* a fix for, because "it worked a few times" doesn't prove anything. You don't want to be debugging a flaky race while a deterministic 400 is also corrupting your signal.
+```
+kubectl logs -n ... | grep -iE 'user/me|401|403|400|token|aud|iss|signature|expired'
+```
 
-**3. They'd contaminate each other's diagnosis if done in the wrong order.** This is the practical trap. Your logs already show both: `x-token MISSING` lines (Bug 1) *and* a 400 with the token present (Bug 2). If you attack Bug 1 first, you can't cleanly tell whether a remaining failure is "token didn't arrive" or "token arrived and got 400'd" — the two symptoms blur. Fixing the consistent one first gives you a **clean success on the happy path**, which becomes your reference: once a token-present call returns 200, *any* remaining failure is unambiguously Bug 1 (token absence), and you can chase the race against a known-good baseline.
-
-**4. Bug 2 is likely one line.** Your trace points hard at a doubled `Bearer` — middleware sets the header and the axios call wraps it again. That's a single-line fix (set the full `Authorization` value in one place, not both). It's a poor trade to defer a one-line deterministic fix to first untangle a concurrency race.
-
-One caveat so this doesn't bite you: confirm the two are truly independent before you commit to the order. The way to be sure is the header dump on a request where context *is* present (your replay shows these exist). If that request shows `Bearer Bearer …` and 400s, Bug 2 is genuinely standalone — fix it. The only scenario where the order flips is if Bug 2 turns out to be *caused by* Bug 1 — e.g. the 400 is actually `Bearer undefined` stringified, not a double Bearer. But you've already established the token is valid and present on the failing calls, so that's ruled out. They're separate, and Bug 2 is downstream.
-
-So: **Bug 2 now** (get one clean 200 with a valid token — likely the double-`Bearer` one-liner), then **Bug 1** (harden the intermittent context against that green baseline). Bonus: the architectural fix for Bug 1 — token read in request scope via middleware `x-token`, passed explicitly — is exactly what makes the Bug 2 header construction simpler too, so doing Bug 2 first also tells you the cleanest single place to set `Authorization` when you finalize Bug 1.
+Send whatever that returns.
