@@ -1,18 +1,22 @@
 
+**File 1 — the HTTP client config
 
-**Don't thread the token through every call site by hand if you can avoid it — it's brittle at 14 touch points.** Passing `Authorization` as a per-call header works, but it means every server-side call site must remember to read the cookie and attach it, and any new call that forgets silently regresses to this same bug. Two cleaner shapes:
+Stop creating the client once when the file loads. Right now it builds a single shared client at module load and exports that one instance. Change it so the client is created on demand by a function instead. That function should: read the auth cookie at the moment it's called, build a fresh client, set the auth token as a default header on that client, attach the existing request and response interceptors, and return it. Remove the old shared-instance creation and the default export of that instance. The function needs to be async, because reading the cookie is now done inside it.
 
-- **A per-request client created in request scope.** Instead of one module-level singleton, expose a small factory that reads the token via the request context and returns an instance with `Authorization` already set. Server code calls the factory (in scope), gets a ready client. This centralizes the token logic in one place while keeping it request-bound — no per-call threading, no singleton reaching for context it lacks.
-- **If you keep per-call headers,** make the service function *require* the token argument (not optional), so a missing token is a type error at compile time rather than a silent 400 at runtime. That turns "someone forgot" into a build failure.
+The key shift: the token is read *inside this function* — which runs in request context — instead of inside the interceptor, which doesn't.
 
-**Also split the base URL while you're in this file.** The instance uses one base URL for both server and client. Server-side calls should target the in-cluster service directly; only the browser needs the public host. Resolving the base URL by execution context (server vs client) in that same factory removes the hairpin and lets you drop the TLS-verification workaround later.
+**File 2 — the interceptor utility 
 
-So the corrected, still-generic recommendation:
+Take the token reading out of the request interceptor entirely. Remove its dependency on the token-reading helper, and remove the line that builds the authorization header. The interceptor should now only set the content-type header and return. The token no longer comes from here — it's already on the client as a default header (from File 1), so the interceptor doesn't need to touch it. Leave the response interceptor as is.
 
-1. Server Component reads the token where request context exists. ✓ (as proposed)
-2. Pass the token into the data layer **explicitly** — ideally via a **request-scoped client factory**, not hand-threaded headers on every call.
-3. Make the token a **required** parameter so omissions fail at build time, not at runtime.
-4. The shared interceptor no longer reads request state at all.
-5. Resolve the base URL by server-vs-client in the same place, so server calls go in-cluster and you can remove the TLS workaround.
+**File 3 — every place that makes an API call
 
-The plan on screen will work as-is; points 2–3 and 5 just make it durable so you don't re-debug this the next time someone adds an endpoint.
+Each of these currently imports the shared client and calls methods on it directly. Change each one to import the new factory function instead, call it (awaiting it) to get a client, then make the request on that returned client. The change is the same in every file: get the client from the function, then use it — rather than using the imported shared instance. These are all server-side files already, which is why this works: calling the factory there gives the cookie read a real request to attach to.
+
+**File 4 — the token-reading helper
+
+No change needed; it's already correct. If you added the temporary cookie-listing debug line earlier, take it out. The helper itself stays for any auth-gating that relies on it.
+
+**Leave alone for now:** the base URL setup and the TLS-verification environment variable. Neither is part of this bug, and the URL is already resolving correctly.
+
+**Why this holds up:** all the token logic now lives in the one factory function. Any future API call that uses the factory gets authentication automatically, so there's nothing per-call to forget — unlike threading the token through all sites by hand.
