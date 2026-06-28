@@ -1,22 +1,13 @@
-
-**File 1 — the HTTP client config
-
-Stop creating the client once when the file loads. Right now it builds a single shared client at module load and exports that one instance. Change it so the client is created on demand by a function instead. That function should: read the auth cookie at the moment it's called, build a fresh client, set the auth token as a default header on that client, attach the existing request and response interceptors, and return it. Remove the old shared-instance creation and the default export of that instance. The function needs to be async, because reading the cookie is now done inside it.
-
-The key shift: the token is read *inside this function* — which runs in request context — instead of inside the interceptor, which doesn't.
-
-**File 2 — the interceptor utility 
-
-Take the token reading out of the request interceptor entirely. Remove its dependency on the token-reading helper, and remove the line that builds the authorization header. The interceptor should now only set the content-type header and return. The token no longer comes from here — it's already on the client as a default header (from File 1), so the interceptor doesn't need to touch it. Leave the response interceptor as is.
-
-**File 3 — every place that makes an API call
-
-Each of these currently imports the shared client and calls methods on it directly. Change each one to import the new factory function instead, call it (awaiting it) to get a client, then make the request on that returned client. The change is the same in every file: get the client from the function, then use it — rather than using the imported shared instance. These are all server-side files already, which is why this works: calling the factory there gives the cookie read a real request to attach to.
-
-**File 4 — the token-reading helper
-
-No change needed; it's already correct. If you added the temporary cookie-listing debug line earlier, take it out. The helper itself stays for any auth-gating that relies on it.
-
-**Leave alone for now:** the base URL setup and the TLS-verification environment variable. Neither is part of this bug, and the URL is already resolving correctly.
-
-**Why this holds up:** all the token logic now lives in the one factory function. Any future API call that uses the factory gets authentication automatically, so there's nothing per-call to forget — unlike threading the token through all sites by hand.
+const urlToken = req.nextUrl.searchParams.get('token');
+  if (urlToken && !req.cookies.get('token')?.value) {
+    const cleanUrl = req.nextUrl.clone();
+    cleanUrl.searchParams.delete('token');
+    const redirectRes = NextResponse.redirect(cleanUrl);
+    redirectRes.cookies.set('token', urlToken, {
+      path: '/',
+      httpOnly: true,
+      secure: true,
+      sameSite: 'lax',
+    });
+    return redirectRes;
+  }
