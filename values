@@ -1,14 +1,26 @@
-            # CORS for browser calls from the frontend origin
-            add_header 'Access-Control-Allow-Origin' 'https://....com' always;
-            add_header 'Access-Control-Allow-Credentials' 'true' always;
-            add_header 'Access-Control-Allow-Headers' 'Authorization, Content-Type' always;
-            add_header 'Access-Control-Allow-Methods' 'GET, POST, PUT, DELETE, OPTIONS' always;
 
-            if ($request_method = OPTIONS) {
-                add_header 'Access-Control-Allow-Origin' 'https://...' always;
-                add_header 'Access-Control-Allow-Credentials' 'true' always;
-                add_header 'Access-Control-Allow-Headers' 'Authorization, Content-Type' always;
-                add_header 'Access-Control-Allow-Methods' 'GET, POST, PUT, DELETE, OPTIONS' always;
-                add_header 'Content-Length' 0;
-                return 204;
-            }
+
+The token-extraction code is correct. The diagnostic shows the request reaching it has an **empty cookie list** — so the cookie isn't being read wrong, it was never present on that request to begin with.
+
+**What an empty cookie list means**
+
+On a server-side render, an empty cookie list means the code is running in a request that **isn't the end user's browser request**. A browser's auth cookie only exists on the request the browser actually made. If a server-side data-fetch isn't bound to that incoming request, the framework's cookie accessor legitimately returns nothing.
+
+The most common cause is a **shared HTTP-client instance created once at module load**, with the data call firing from a place that has **no request context attached**. The token-reading function works fine; the problem is *where the call originates* — it has no request bound to it. This is the same "detached request context" issue resurfacing one level up.
+
+**What's needed to pin the exact fix**
+
+Two things, because "the cookie isn't on the request" has two distinct origins that need different fixes:
+
+1. **Where the HTTP-client instance is created** — the module that constructs the client and registers the request interceptor. The question: is it a module-level singleton, and how is the base URL configured?
+
+2. **The actual data call site** — the server component / page / service function that triggers the request. The question: what context is it running in when it fires?
+
+**The two likely fixes**
+
+- **If it's a server-side fetch detached from the request:** the call must be made *inside request scope*, with the cookie read there and forwarded explicitly on that specific call — rather than relying on a module-level client that has no request bound to it.
+- **If the call is actually client-side** (but logging appears server-side): the browser must be told to send credentials with cross-origin requests, and the cookie's domain/scope must cover the API host. An empty *server-side* cookie list makes this the less likely branch.
+
+**One check to run now**
+
+Confirm whether the data request is being made server-side **on the user's behalf at all**, or whether it's firing during a build, prefetch, or background render with **no user attached**. An empty cookie list strongly suggests the latter — the request simply has no user session to carry.
