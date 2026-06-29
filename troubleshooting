@@ -1,11 +1,28 @@
-Two things:
 
-**1. The JWT claims.** Decode the `token` cookie value (paste it at jwt.io, or `echo PASTE | cut -d. -f2 | base64 -d`). Send me the **`aud`, `iss`, and `exp`** fields. Redact the values if you want — I just need to see what they are.
+**Step 1 — Capture the failing downstream call (do this first).**
+Tail the backend's application log while firing one authenticated request, so you can see the outbound subsystem URL and the response it gets at the moment it fails.
 
-**2. The backend's rejection reason.** Logs from the backend pod for the `/user/me` call that now arrives with the Bearer token:
+- In one terminal, follow the backend application log (unfiltered, last few lines onward).
+- In another, send a single authenticated request to the endpoint from inside the network, bypassing edge transport checks, using the full token.
 
-```
-kubectl logs -n ... | grep -iE 'user/me|401|403|400|token|aud|iss|signature|expired'
-```
+Look in the log for: an outbound URL to one of the upstream subsystems, the HTTP status it returns, and any stack trace or message. That line tells you *which* subsystem and *why*.
 
-Send whatever that returns.
+If the backend doesn't log the outbound call, raise log verbosity temporarily — set the HTTP-client/web layer (and your application's base package) to debug level via configuration, restart, and repeat. You need to see the request actually leave the backend.
+
+**Step 2 — Interpret what you get, and act on it:**
+
+- **Upstream returns “unauthorized/forbidden”** → a credential/identity problem on the backend→subsystem hop. Check the key the gateway sends to that subsystem, and whether the subsystem expects the user's token forwarded versus a service credential. Fix the key or the forwarding.
+
+- **Upstream returns “not found” / connection error / wrong host** → an environment-target mismatch. Confirm each subsystem host in configuration points at the correct environment. (You already have one concrete suspect: one subsystem host uses a different environment prefix than its siblings — verify that one first.)
+
+- **Upstream itself returns the generic error** → the gateway is passing something the subsystem rejects (a missing or blank user identifier, a wrong field). Check what identifier the gateway extracts from the token and forwards, and whether this user has the required record on that subsystem.
+
+- **A stack trace / server error in the gateway before any outbound call** → it isn't a downstream call at all; the handler is throwing (null field, deserialization). The trace names the line.
+
+**Step 3 — Verify the fix end-to-end.**
+After changing the configuration, key, or host, redeploy the backend and re-run the same in-network request. Expect a success response with the user profile. Then load the page in the browser as a signed-in user — it should render instead of erroring.
+
+**Step 4 — Hardening (only after it works).**
+Switch the frontend's server-side calls to the internal service address and remove the temporary transport-verification workaround, so server-to-server traffic no longer depends on the public hostname.
+
+The single most important action is **Step 1** — token, route, and token-validity are already ruled out, so the answer is in that one outbound log line. Capture the subsystem URL and status, and that determines which fix in Step 2 applies.
