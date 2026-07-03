@@ -1,19 +1,19 @@
-kubectl -n nebula-stack logs -f deploy/orion-web
-kubectl -n nebula-stack port-forward deploy/orion-web 3000:3000 &
+kubectl -n nebula-stack exec slatehouse-0 -- clickhouse-client --query "SELECT name, formatReadableSize(free_space) AS free, formatReadableSize(total_space) AS total FROM system.disks"
+kubectl -n nebula-stack exec slatehouse-0 -- df -h
+kubectl -n nebula-stack exec slatehouse-0 -- sh -c 'du -xh --max-depth=2 /var/lib/clickhouse 2>/dev/null | sort -rh | head -15; du -sh /var/log/clickhouse-server'
+kubectl -n nebula-stack get pvc
+kubectl -n nebula-stack exec slatehouse-0 -- sh -c 'truncate -s 0 /var/log/clickhouse-server/clickhouse-server.log /var/log/clickhouse-server/clickhouse-server.err.log'
+kubectl -n nebula-stack exec slatehouse-0 -- clickhouse-client --query "TRUNCATE TABLE IF EXISTS system.text_log; TRUNCATE TABLE IF EXISTS system.trace_log; TRUNCATE TABLE IF EXISTS system.metric_log; TRUNCATE TABLE IF EXISTS system.asynchronous_metric_log; TRUNCATE TABLE IF EXISTS system.part_log; TRUNCATE TABLE IF EXISTS system.query_log"
+kubectl -n nebula-stack exec slatehouse-0 -- clickhouse-client --query "CREATE TABLE default.space_test (x UInt8) ENGINE=MergeTree ORDER BY x; INSERT INTO default.space_test VALUES (1); DROP TABLE default.space_test"
+kubectl -n nebula-stack exec deploy/orion-worker -- sh -c 'cd /app/worker && node -e "const R=require(\"ioredis\");const r=new R({host:\"ember-cache\",port:6379});(async()=>{console.log(\"PING:\",await r.ping());const b=await r.eval(\"return string.rep(\\\"x\\\",200000)\",0);console.log(\"200KB:\",b.length);process.exit(0)})().catch(e=>{console.error(\"FAIL:\",e.message);process.exit(1)})"'
+kubectl -n nebula-stack exec deploy/orion-worker -- cat /sys/class/net/eth0/mtu
+kubectl -n nebula-stack get po -o wide | grep -E 'orion-web|orion-worker|ember-cache|slatehouse'
+kubectl -n nebula-stack set env deploy/orion-worker --list | grep -i pipelining
+kubectl -n nebula-stack set env deploy/orion-web --list | grep -i pipelining
+argocd app get orion
+kill %1
+kubectl -n nebula-stack port-forward deploy/orion-web 3001:3000 &
 sleep 3
-curl -si -m 20 -u 'pk-owl-12345678-1234-1234-1234-123456789abc:SK_FULL_VALUE_HERE' -X POST http://127.0.0.1:3000/api/public/ingestion -H 'Content-Type: application/json' -d '{"batch":[{"id":"evt-pf-1","type":"trace-create","timestamp":"2026-07-03T00:10:00.000Z","body":{"id":"trace-pf-1","name":"pf-test","timestamp":"2026-07-03T00:10:00.000Z"}}]}'
+curl -si -m 20 -u 'pk-owl-12345678-1234-1234-1234-123456789abc:SK_FULL_VALUE_HERE' -X POST http://127.0.0.1:3001/api/public/ingestion -H 'Content-Type: application/json' -d '{"batch":[{"id":"evt-pf-1","type":"trace-create","timestamp":"2026-07-03T00:10:00.000Z","body":{"id":"trace-pf-1","name":"pf-test","timestamp":"2026-07-03T00:10:00.000Z"}}]}'
 sleep 45
 kubectl -n nebula-stack exec slatehouse-0 -- clickhouse-client --query "SELECT id,name FROM traces WHERE id='trace-pf-1'"
-kubectl -n nebula-stack logs -f deploy/orion-worker
-kubectl -n nebula-stack set env deploy/orion-web --list | grep -iE 'S3|BUCKET|EVENT_UPLOAD'
-kubectl -n nebula-stack logs deploy/orion-web | grep -i s3
-kubectl -n nebula-stack set env deploy/orion-worker --list | grep PIPELINING
-kubectl -n nebula-stack set env deploy/orion-web --list | grep PIPELINING
-argocd app get orion
-kubectl -n nebula-stack get deploy ember-cache -o yaml | grep -iE 'volume|persistent|emptyDir|claim'
-kubectl -n nebula-stack get po -o wide | grep -E 'orion-web|orion-worker|ember-cache'
-kubectl -n nebula-stack exec ember-cache-0 -- sh -c 'for q in $(valkey-cli --scan --pattern "bull:*:wait"); do echo -n "$q = "; valkey-cli llen "$q"; done'
-kubectl -n nebula-stack rollout restart deploy/orion-web
-kubectl -n nebula-stack rollout restart deploy/orion-worker
-kubectl -n nebula-stack rollout status deploy/orion-web
-kubectl -n nebula-stack rollout status deploy/orion-worker
