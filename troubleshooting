@@ -1,23 +1,16 @@
-kubectl get sc -o custom-columns=NAME:.metadata.name,EXPAND:.allowVolumeExpansion
-kubectl -n nebula-stack patch pvc data-slatehouse-0 -p '{"spec":{"resources":{"requests":{"storage":"40Gi"}}}}'
-kubectl -n nebula-stack get pvc data-slatehouse-0 -w
+kubectl -n nebula-stack exec slatehouse-0 -- clickhouse-client --query "CREATE TABLE default.space_test (x UInt8) ENGINE=MergeTree ORDER BY x; INSERT INTO default.space_test VALUES (1); SELECT count() FROM default.space_test; DROP TABLE default.space_test"
 kubectl -n nebula-stack exec slatehouse-0 -- df -h /var/lib/clickhouse
-kubectl -n nebula-stack exec slatehouse-0 -- clickhouse-client --query "TRUNCATE TABLE system.text_log; TRUNCATE TABLE system.trace_log; TRUNCATE TABLE system.metric_log; TRUNCATE TABLE system.asynchronous_metric_log; TRUNCATE TABLE system.part_log; TRUNCATE TABLE system.query_log"
-kubectl -n nebula-stack exec slatehouse-0 -- clickhouse-client --query "CREATE TABLE default.space_test (x UInt8) ENGINE=MergeTree ORDER BY x; INSERT INTO default.space_test VALUES (1); DROP TABLE default.space_test"
-kubectl -n nebula-stack exec slatehouse-0 -- clickhouse-client --query "SELECT id,name FROM traces WHERE id LIKE 'trace-pf%'"
 kubectl -n nebula-stack port-forward deploy/orion-web 3001:3000 &
 sleep 3
-curl -si -m 20 -u 'pk-owl-12345678-1234-1234-1234-123456789abc:SK_FULL_VALUE_HERE' -X POST http://127.0.0.1:3001/api/public/ingestion -H 'Content-Type: application/json' -d '{"batch":[{"id":"evt-pf-2","type":"trace-create","timestamp":"2026-07-03T00:20:00.000Z","body":{"id":"trace-pf-2","name":"pf-test-2","timestamp":"2026-07-03T00:20:00.000Z"}}]}'
+curl -si -m 20 -u 'pk-owl-12345678-1234-1234-1234-123456789abc:SK_FULL_VALUE_HERE' -X POST http://127.0.0.1:3001/api/public/ingestion -H 'Content-Type: application/json' -d '{"batch":[{"id":"evt-pf-3","type":"trace-create","timestamp":"2026-07-03T00:30:00.000Z","body":{"id":"trace-pf-3","name":"pf-test-3","timestamp":"2026-07-03T00:30:00.000Z"}}]}'
 sleep 30
-kubectl -n nebula-stack exec slatehouse-0 -- clickhouse-client --query "SELECT id,name FROM traces WHERE id LIKE 'trace-pf%'"
 kubectl -n nebula-stack exec slatehouse-0 -- clickhouse-client --query "SELECT count() FROM traces"
-kubectl -n nebula-stack logs deploy/orion-worker --tail=50 | grep -iE 'error|ingestion'
-kubectl -n nebula-stack exec slatehouse-0 -- sh -c 'du -xh --max-depth=2 /var/lib/clickhouse 2>/dev/null | sort -rh | head -20'
-kubectl -n nebula-stack get pvc
-kubectl -n nebula-stack delete pvc data-old-slatehouse-shard0-0 data-old-postgres-0 ember-cache-data-old-primary-0
+kubectl -n nebula-stack exec slatehouse-0 -- clickhouse-client --query "SELECT id,name FROM traces WHERE id='trace-pf-3'"
+kubectl -n nebula-stack logs deploy/orion-worker --tail=100 | grep -iE 'error|ingestion'
 kubectl -n nebula-stack set env deploy/orion-worker --list | grep -i REDIS_ENABLE_AUTO_PIPELINING
 kubectl -n nebula-stack set env deploy/orion-web --list | grep -i REDIS_ENABLE_AUTO_PIPELINING
-argocd app get orion
+kubectl -n nebula-stack get pvc data-slatehouse-0
+<!-- config.d/reduce-logging.xml -->
 <clickhouse>
   <logger>
     <level>information</level>
@@ -30,3 +23,12 @@ argocd app get orion
     <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
   </query_log>
 </clickhouse>
+curl -si -m 20 -u 'pk-owl-12345678-1234-1234-1234-123456789abc:SK_FULL_VALUE_HERE' -X POST https://quartz-river.example.com/api/public/ingestion -H 'Content-Type: application/json' -d '{"batch":[{"id":"evt-realpath-1","type":"trace-create","timestamp":"2026-07-03T00:40:00.000Z","body":{"id":"trace-realpath-1","name":"realpath-test","timestamp":"2026-07-03T00:40:00.000Z"}}]}'
+sleep 30
+kubectl -n nebula-stack exec slatehouse-0 -- clickhouse-client --query "SELECT id,name FROM traces WHERE id='trace-realpath-1'"
+jobs
+kill %1
+kubectl -n nebula-stack get pvc
+kubectl -n nebula-stack delete pvc data-old-slatehouse-shard0-0 data-old-postgres-0 ember-cache-data-old-primary-0
+argocd app get orion
+argocd app sync orion
