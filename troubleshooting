@@ -1,34 +1,19 @@
-kubectl -n nebula-stack exec deploy/orion-worker -- sh -c 'cd /app/worker && node -e "
-const Redis = require(\"ioredis\");
-const r = new Redis({
-  host: process.env.REDIS_HOST || \"ember-cache\",
-  port: Number(process.env.REDIS_PORT || 6379),
-  password: process.env.REDIS_AUTH || undefined
-});
-(async () => {
-  console.log(\"PING:\", await r.ping());
-  const big = await r.eval(\"return string.rep(\\\"x\\\",200000)\", 0);
-  console.log(\"200KB reply OK:\", big.length);
-  process.exit(0);
-})().catch(e => {
-  console.error(\"FAIL:\", e.message);
-  process.exit(1);
-});
-"'
-kubectl -n nebula-stack get po -o wide | grep -E 'worker|ember-cache|web'
-kubectl get nodes --sort-by=.metadata.creationTimestamp
-NODE=$(kubectl -n nebula-stack get po -l app=ember-cache -o jsonpath='{.items[0].spec.nodeName}')
-kubectl -n nebula-stack patch deploy orion-worker -p "{\"spec\":{\"template\":{\"spec\":{\"nodeSelector\":{\"kubernetes.io/hostname\":\"$NODE\"}}}}}"
-kubectl -n nebula-stack set env deploy/orion-worker REDIS_ENABLE_AUTO_PIPELINING=false
-kubectl -n nebula-stack set env deploy/orion-web REDIS_ENABLE_AUTO_PIPELINING=false
-kubectl -n nebula-stack exec deploy/ember-cache -- sh -c 'for q in $(valkey-cli --scan --pattern "bull:*:wait"); do echo -n "$q = "; valkey-cli llen "$q"; done'
-curl -si -u "pk-owl-REAL:sk-owl-REAL" -X POST https://quartz-river.example.com/api/public/ingestion \
-  -H 'Content-Type: application/json' \
-  -d '{"batch":[{"id":"evt-random-1","type":"trace-create","timestamp":"2026-07-01T04:00:00.000Z","body":{"id":"trace-random-1","name":"smoke-test","timestamp":"2026-07-01T04:00:00.000Z"}}]}'
-kubectl -n nebula-stack exec slatehouse-0 -- clickhouse-client --query "SELECT id,name FROM traces WHERE id='trace-random-1'"
-kubectl -n nebula-stack logs deploy/orion-worker | grep -i clickhouse
-kubectl -n nebula-stack logs slatehouse-0
-kubectl -n nebula-stack rollout restart deploy/orion-worker
+kubectl -n nebula-stack logs -f deploy/orion-web
+kubectl -n nebula-stack port-forward deploy/orion-web 3000:3000 &
+sleep 3
+curl -si -m 20 -u 'pk-owl-12345678-1234-1234-1234-123456789abc:SK_FULL_VALUE_HERE' -X POST http://127.0.0.1:3000/api/public/ingestion -H 'Content-Type: application/json' -d '{"batch":[{"id":"evt-pf-1","type":"trace-create","timestamp":"2026-07-03T00:10:00.000Z","body":{"id":"trace-pf-1","name":"pf-test","timestamp":"2026-07-03T00:10:00.000Z"}}]}'
+sleep 45
+kubectl -n nebula-stack exec slatehouse-0 -- clickhouse-client --query "SELECT id,name FROM traces WHERE id='trace-pf-1'"
+kubectl -n nebula-stack logs -f deploy/orion-worker
+kubectl -n nebula-stack set env deploy/orion-web --list | grep -iE 'S3|BUCKET|EVENT_UPLOAD'
+kubectl -n nebula-stack logs deploy/orion-web | grep -i s3
+kubectl -n nebula-stack set env deploy/orion-worker --list | grep PIPELINING
+kubectl -n nebula-stack set env deploy/orion-web --list | grep PIPELINING
+argocd app get orion
+kubectl -n nebula-stack get deploy ember-cache -o yaml | grep -iE 'volume|persistent|emptyDir|claim'
+kubectl -n nebula-stack get po -o wide | grep -E 'orion-web|orion-worker|ember-cache'
+kubectl -n nebula-stack exec ember-cache-0 -- sh -c 'for q in $(valkey-cli --scan --pattern "bull:*:wait"); do echo -n "$q = "; valkey-cli llen "$q"; done'
 kubectl -n nebula-stack rollout restart deploy/orion-web
-kubectl -n nebula-stack rollout status deploy/orion-worker
+kubectl -n nebula-stack rollout restart deploy/orion-worker
 kubectl -n nebula-stack rollout status deploy/orion-web
+kubectl -n nebula-stack rollout status deploy/orion-worker
