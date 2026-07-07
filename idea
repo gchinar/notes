@@ -1,9 +1,17 @@
-Your concern is valid. The overall pipeline design is correct (SNS contact point → SQS → Lambda, fixing the message body so `json.loads` works), and the template does loop over `.Alerts` with `range` — so it handles multiple *instances* in one notification. But every label and the description are hard-coded literals, which causes two problems:
+This is exactly why the change shouldn't be made on the shared contact point. Two separate problems, two fixes:
 
-1. Contact points are shared in Grafana. The doc says this pattern will be reused for other alerts, but any other rule pointing at `EXAMPLE-PRD-Alerts-SNS-INTERNAL` would report itself as "Airflow High CPU Utilization."
-2. Even for this one rule, if several instances fire (e.g., multiple environments), every entry in the array is identical — you can't tell which resource triggered.
+**1. Don't touch the email path — make this additive**
 
-The fix is to make the template pull from each alert's own labels/annotations, which Section 7 already requires you to set on the rule anyway:
+If you replace the message template on a topic that email subscribers use, they'll start receiving raw JSON. Instead, keep the existing SNS integration (with Grafana's default readable message) exactly as it is, and add a second delivery path just for the machine pipeline:
+
+- A Grafana contact point can hold multiple integrations. Add a second AWS SNS integration to the same contact point, pointing to a **new** topic that only the SQS queue subscribes to. That integration gets the JSON template.
+- Or create a separate contact point and route alerts to both via notification policies with "continue matching" enabled.
+
+Either way, emails keep looking exactly like today, and the Lambda gets clean JSON. Nobody loses information.
+
+**2. Alerts without labels: use a generic template + Lambda defaults**
+
+Don't hard-code six labels that 260 rules don't have. Dump whatever labels and annotations each alert actually has:
 
 ```
 {
@@ -13,16 +21,16 @@ The fix is to make the template pull from each alert's own labels/annotations, w
     {
       "status": {{ printf "%q" $alert.Status }},
       "labels": {
-        "alertname": {{ printf "%q" $alert.Labels.alertname }},
-        "component": {{ printf "%q" $alert.Labels.component }},
-        "account_id": {{ printf "%q" $alert.Labels.account_id }},
-        "resource": {{ printf "%q" $alert.Labels.resource }},
-        "region": {{ printf "%q" $alert.Labels.region }},
-        "stage": {{ printf "%q" $alert.Labels.stage }},
-        "subsys": {{ printf "%q" $alert.Labels.subsys }}
+        {{- range $j, $p := $alert.Labels.SortedPairs }}
+        {{- if $j }},{{ end }}
+        {{ printf "%q" $p.Name }}: {{ printf "%q" $p.Value }}
+        {{- end }}
       },
       "annotations": {
-        "description": {{ printf "%q" $alert.Annotations.description }}
+        {{- range $j, $p := $alert.Annotations.SortedPairs }}
+        {{- if $j }},{{ end }}
+        {{ printf "%q" $p.Name }}: {{ printf "%q" $p.Value }}
+        {{- end }}
       }
     }
     {{- end }}
@@ -30,6 +38,6 @@ The fix is to make the template pull from each alert's own labels/annotations, w
 }
 ```
 
-`printf "%q"` handles JSON escaping (quotes, newlines in descriptions). Two caveats: every rule using this contact point must define all six labels, or those fields render as empty strings; and if a label is missing you won't get an error, just `""`. Also, one testing gotcha worth adding to Section 9: unless the SQS subscription has raw message delivery enabled, SQS receives an SNS envelope with your JSON nested inside the `Message` field as a string — the Lambda needs to unwrap that before `json.loads`.
+Every Grafana alert automatically carries at least `alertname` and `grafana_folder` labels, and most rules have summary/description annotations — so even label-less alerts arrive with a usable identity. The Lambda then fills gaps: if `component` or `stage` is missing, apply defaults or a small lookup table keyed on alertname/folder. Teams can then add proper labels rule-by-rule over time instead of a big-bang migration of 260 alerts.
 
-Want me to update the runbook doc with the dynamic template and these notes?
+Want me to rewrite the runbook to reflect this — additive second topic, generic template, and Lambda-side defaults?
