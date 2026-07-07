@@ -1,43 +1,194 @@
-This is exactly why the change shouldn't be made on the shared contact point. Two separate problems, two fixes:
+Grafana Alert Routing to Internal Alert System
+Dummy runbook v2 — generic pattern for all Grafana alerts (pilot: Airflow CPU Utilization)
 
-**1. Don't touch the email path — make this additive**
-
-If you replace the message template on a topic that email subscribers use, they'll start receiving raw JSON. Instead, keep the existing SNS integration (with Grafana's default readable message) exactly as it is, and add a second delivery path just for the machine pipeline:
-
-- A Grafana contact point can hold multiple integrations. Add a second AWS SNS integration to the same contact point, pointing to a **new** topic that only the SQS queue subscribes to. That integration gets the JSON template.
-- Or create a separate contact point and route alerts to both via notification policies with "continue matching" enabled.
-
-Either way, emails keep looking exactly like today, and the Lambda gets clean JSON. Nobody loses information.
-
-**2. Alerts without labels: use a generic template + Lambda defaults**
-
-Don't hard-code six labels that 260 rules don't have. Dump whatever labels and annotations each alert actually has:
-
-```
+1. Purpose
+Grafana alerts need to be sent to an internal alert system. The internal alert system receives events through a Lambda function created by the DaaS/internal alert system developer. Grafana must send alerts in a JSON format that the Lambda can parse and transform into the internal alert object.
+This version replaces the earlier single-alert approach. It defines one generic pattern that works for all (~260) Grafana alerts, including rules that do not define custom labels, and it does so without changing anything for the people who currently receive these alerts by email through SNS. The Airflow CPU Utilization alert is used as the pilot.
+2. Design Principles
+Additive, not destructive. The existing SNS topic, its email subscribers, and the human-readable message they receive today are not modified. The JSON feed is delivered through a new, separate SNS topic that only the SQS queue subscribes to.
+Generic template. The contact point message template contains no alert-specific values. It serializes whatever labels and annotations each alert actually has. Every Grafana alert automatically carries at least the alertname and grafana_folder labels, so even rules with no custom labels produce a usable payload.
+Tolerant Lambda. The Lambda treats all custom labels as optional and applies defaults or a lookup table when a label is missing. An alert must never be dropped because a label is absent.
+Gradual adoption. Teams add the standard label set to their rules over time. As labels appear, the Lambda's defaults are used less. No big-bang migration of 260 rules is required.
+3. Target Architecture
+Grafana Alert Rule
+  -> Contact Point
+       Integration 1 (existing, UNCHANGED):
+         -> SNS Topic: arn:aws:sns:us-east-1:111122223333:EXAMPLE-PRD-Alerts
+         -> Email subscribers (default human-readable Grafana message)
+       Integration 2 (NEW):
+         -> SNS Topic: arn:aws:sns:us-east-1:111122223333:EXAMPLE-PRD-Alerts-JSON
+         -> SQS Queue: arn:aws:sqs:us-east-1:111122223333:example-prd-alerts-queue
+              (raw message delivery ENABLED)
+         -> Lambda: example-alert-transformer-lambda
+         -> Internal Alert System API
+         -> Internal Alert UI
+A Grafana contact point can contain multiple integrations, and every integration fires for each notification. This is what makes the design additive: email and JSON are two integrations on the same contact point, each with its own topic and its own message template.
+4. Why This Design
+The Lambda needs json.loads(message) to succeed, so its input must be strict JSON. Email recipients need readable text, not JSON. One message template cannot serve both audiences, so the delivery paths are split: the existing topic keeps the default Grafana message for humans, and the new topic carries JSON for machines.
+Hard-coding label values in the template (the earlier approach) only works for one alert rule and cannot distinguish multiple firing instances. Because roughly 260 rules share contact points and most rules do not define the full label set, the template must be generic and the Lambda must supply defaults.
+5. AWS Setup — New JSON Topic
+Create a new SNS topic: EXAMPLE-PRD-Alerts-JSON.
+Subscribe the existing SQS queue (example-prd-alerts-queue) to the new topic.
+Enable raw message delivery on the SQS subscription. Without it, SNS wraps the payload in a notification envelope and the Lambda receives the JSON as a string inside the "Message" field instead of at the top level.
+Do not add email subscribers to this topic.
+Leave the existing EXAMPLE-PRD-Alerts topic and its email subscriptions untouched.
+6. Grafana Changes
+Pilot phase (only the pilot rule sends JSON):
+Grafana -> Alerting -> Contact points -> + Create contact point
+  Name: EXAMPLE-PRD-Alerts-DUAL
+  Integration 1: AWS SNS -> topic EXAMPLE-PRD-Alerts
+                 (leave the Message field at the Grafana default)
+  Integration 2: AWS SNS -> topic EXAMPLE-PRD-Alerts-JSON
+                 (paste the generic JSON template from Section 7
+                  into the Message field)
+  Save
+Point only the Airflow High CPU Utilization rule at this contact point during the pilot.
+Org-wide phase (after the pilot is validated):
+Grafana -> Alerting -> Contact points -> EXAMPLE-PRD-Alerts-SNS-INTERNAL -> Edit
+  Integration 1 (existing SNS/email): keep exactly as it is
+  + Add integration: AWS SNS -> topic EXAMPLE-PRD-Alerts-JSON
+                     -> paste the generic JSON template
+  Save
+All rules using this contact point now feed the internal alert system automatically, with no per-rule changes. Point the pilot rule back at the shared contact point and delete the DUAL one.
+Do not change alert rule queries, thresholds, evaluation behavior, summaries, or descriptions for this work.
+7. Generic JSON Template
+Paste the following into the Message field of the JSON SNS integration only. It contains no alert-specific values and is shared by all rules.
 {
   "alerts": [
     {{- range $i, $alert := .Alerts }}
     {{- if $i }},{{ end }}
     {
       "status": {{ printf "%q" $alert.Status }},
+      "fingerprint": {{ printf "%q" $alert.Fingerprint }},
       "labels": {
-        {{- range $j, $p := $alert.Labels.SortedPairs }}
+        {{- range $j, $pair := $alert.Labels.SortedPairs }}
         {{- if $j }},{{ end }}
-        {{ printf "%q" $p.Name }}: {{ printf "%q" $p.Value }}
+        {{ printf "%q" $pair.Name }}: {{ printf "%q" $pair.Value }}
         {{- end }}
       },
       "annotations": {
-        {{- range $j, $p := $alert.Annotations.SortedPairs }}
+        {{- range $j, $pair := $alert.Annotations.SortedPairs }}
         {{- if $j }},{{ end }}
-        {{ printf "%q" $p.Name }}: {{ printf "%q" $p.Value }}
+        {{ printf "%q" $pair.Name }}: {{ printf "%q" $pair.Value }}
         {{- end }}
       }
     }
     {{- end }}
   ]
 }
-```
+How it works:
+Iterates over every alert instance in the notification, so multiple simultaneous alerts produce multiple array entries.
+Serializes every label and annotation the alert actually has. Nothing is hard-coded, so the same template serves all 260 rules.
+printf "%q" escapes quotes, backslashes, and newlines, keeping the rendered body valid JSON even when descriptions contain special characters.
+fingerprint is a stable per-alert hash provided by Grafana; the internal system can use it as the dedup key for create-vs-update. If your Grafana version does not expose .Fingerprint, delete that line — the Lambda falls back to a hash of alertname plus labels.
+A label a rule does not define simply does not appear in the payload (rather than appearing as an empty string), which makes "missing" detectable on the Lambda side.
+8. Standard Label Set (Target State, Optional Per Rule)
+These labels are the recommended standard for mapping into the internal alert system. Rules without them still flow; the Lambda applies the fallbacks in Section 9. Dummy values shown are from the pilot rule.
+Label
+Meaning
+Pilot dummy value
+component
+Owning component
+EXAMPLE_APP
+account_id
+Cloud account identifier
+111122223333
+resource
+Affected resource
+Airflow CPU Utilization
+region
+Cloud region
+us-east-1
+stage
+Environment / stage
+prd
+subsys
+Subsystem or service family
+aws/example-mwaa
 
-Every Grafana alert automatically carries at least `alertname` and `grafana_folder` labels, and most rules have summary/description annotations — so even label-less alerts arrive with a usable identity. The Lambda then fills gaps: if `component` or `stage` is missing, apply defaults or a small lookup table keyed on alertname/folder. Teams can then add proper labels rule-by-rule over time instead of a big-bang migration of 260 alerts.
 
-Want me to rewrite the runbook to reflect this — additive second topic, generic template, and Lambda-side defaults?
+9. Lambda Developer Notes
+Parsing. With raw message delivery enabled, the SQS record body is the JSON payload itself. Keep an envelope fallback for safety:
+def parse_body(body: str) -> dict:
+    payload = json.loads(body)
+    # Fallback if raw message delivery is off (SNS envelope)
+    if isinstance(payload, dict) and payload.get("Type") == "Notification":
+        payload = json.loads(payload["Message"])
+    return payload
+Mapping with fallbacks. Read every field with .get(); never fail on a missing label.
+Internal field
+Primary source
+Fallback when missing
+Title / name
+labels.alertname
+Always present (added by Grafana)
+Grouping
+labels.grafana_folder
+Always present (added by Grafana)
+State
+status
+— ("firing" / "resolved")
+Dedup key
+fingerprint
+Hash of alertname + sorted labels
+Component
+labels.component
+Lookup by alertname or folder; else "UNMAPPED"
+Account ID
+labels.account_id
+Static per-environment default
+Resource
+labels.resource
+labels.alertname
+Region
+labels.region
+Static default (us-east-1)
+Stage
+labels.stage
+Static default (prd)
+Subsystem
+labels.subsys
+Lookup table; else "UNKNOWN"
+Description
+annotations.description
+annotations.summary; else alertname
+
+
+A small config or lookup table keyed by alertname or grafana_folder can supply component/subsys values for important alerts before their owners add labels to the rules.
+10. Pilot: Airflow CPU Utilization
+Field
+Dummy value
+Alert name
+Airflow High CPU Utilization
+Contact point (pilot)
+EXAMPLE-PRD-Alerts-DUAL
+Threshold
+CPU utilization above 80%
+Summary
+Airflow High CPU Utilization
+Description
+Airflow CPU Utilization is above threshold 80% in prd us-east-1.
+
+
+Add the six standard labels from Section 8 to this rule so the pilot proves the fully-labeled path. Keep the query, threshold, and evaluation behavior unchanged.
+11. Testing Steps
+Complete the AWS setup in Section 5 and create the DUAL contact point from Section 6.
+Point the pilot rule at the DUAL contact point and trigger, preview, or wait for it to fire.
+Regression check: confirm email recipients receive the same readable message as before.
+Confirm the EXAMPLE-PRD-Alerts-JSON topic receives a message and the SQS record body is bare JSON (starts with "{", not an SNS envelope).
+Ask the Lambda developer to confirm json.loads succeeds and the mapped alert appears in the internal alert UI with the pilot labels.
+Fire a resolved transition and confirm the internal alert updates (not duplicates) via the fingerprint.
+Label-less test: temporarily point one alert rule that has no custom labels at the DUAL contact point. Confirm the payload contains only alertname/grafana_folder plus annotations, and the Lambda's fallbacks still produce a sensible internal alert.
+Only after steps 3–7 pass, perform the org-wide phase in Section 6.
+12. Rollout Plan
+Phase 1 — Pilot. DUAL contact point; only the Airflow rule sends JSON. Validate end to end, including the label-less test.
+Phase 2 — Org-wide. Add the JSON integration to the shared contact point(s). All ~260 alerts start flowing to the internal system with no per-rule changes. Email behavior is unchanged throughout.
+Phase 3 — Label adoption. Teams add the standard label set (Section 8) to their rules over time. Lambda fallbacks and the lookup table shrink as label coverage grows.
+13. Checklist
+Existing email topic, subscribers, and message template are untouched.
+New JSON topic created; SQS subscription has raw message delivery enabled; no email subscribers on it.
+Generic JSON template pasted only into the JSON SNS integration; rendered body verified as valid JSON in SQS.
+Template contains no alert-specific values.
+Lambda parses the payload, tolerates missing labels, applies fallbacks, and uses fingerprint for create/update.
+Pilot validated with a fully-labeled rule and a label-less rule before org-wide enablement.
+Dummy runbook — replace placeholder values before production use.
