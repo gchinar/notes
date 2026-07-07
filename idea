@@ -1,15 +1,35 @@
-Yes — here is the broadened version:
+Your concern is valid. The overall pipeline design is correct (SNS contact point → SQS → Lambda, fixing the message body so `json.loads` works), and the template does loop over `.Alerts` with `range` — so it handles multiple *instances* in one notification. But every label and the description are hard-coded literals, which causes two problems:
 
-#15 — Smart Home Device Sound Confusion Suppression
+1. Contact points are shared in Grafana. The doc says this pattern will be reused for other alerts, but any other rule pointing at `EXAMPLE-PRD-Alerts-SNS-INTERNAL` would report itself as "Airflow High CPU Utilization."
+2. Even for this one rule, if several instances fire (e.g., multiple environments), every entry in the array is identical — you can't tell which resource triggered.
 
-Summary
+The fix is to make the template pull from each alert's own labels/annotations, which Section 7 already requires you to set on the rule anyway:
 
-The invention detects when media content, such as a movie, TV show, video, game, advertisement, or music, contains a sound that matches or resembles notification sounds used by smart devices present in the user’s smart home environment.
+```
+{
+  "alerts": [
+    {{- range $i, $alert := .Alerts }}
+    {{- if $i }},{{ end }}
+    {
+      "status": {{ printf "%q" $alert.Status }},
+      "labels": {
+        "alertname": {{ printf "%q" $alert.Labels.alertname }},
+        "component": {{ printf "%q" $alert.Labels.component }},
+        "account_id": {{ printf "%q" $alert.Labels.account_id }},
+        "resource": {{ printf "%q" $alert.Labels.resource }},
+        "region": {{ printf "%q" $alert.Labels.region }},
+        "stage": {{ printf "%q" $alert.Labels.stage }},
+        "subsys": {{ printf "%q" $alert.Labels.subsys }}
+      },
+      "annotations": {
+        "description": {{ printf "%q" $alert.Annotations.description }}
+      }
+    }
+    {{- end }}
+  ]
+}
+```
 
-These sounds may include a smartphone ringtone, smartwatch alert, smart doorbell chime, washing machine completion tone, microwave beep, oven timer, refrigerator alert, smart speaker notification, security camera alert, robot vacuum sound, baby monitor alert, or other IoT device sounds.
+`printf "%q"` handles JSON escaping (quotes, newlines in descriptions). Two caveats: every rule using this contact point must define all six labels, or those fields render as empty strings; and if a label is missing you won't get an error, just `""`. Also, one testing gotcha worth adding to Section 9: unless the SQS subscription has raw message delivery enabled, SQS receives an SNS envelope with your JSON nested inside the `Message` field as a string — the Lambda needs to unwrap that before `json.loads`.
 
-When a matching or similar sound is detected in the media, the system selectively mutes, reduces, replaces, delays, spatially shifts, labels, or modifies only that sound so the user does not mistake media audio for a real smart-home device event. The remaining media audio continues normally.
-
-Concise Novelty
-
-The novelty lies in detecting media sounds that resemble notification or alert sounds of smart devices present in a user’s smart home environment, and selectively modifying only those confusing sounds in the media to prevent false user responses while preserving the rest of the audio experience.
+Want me to update the runbook doc with the dynamic template and these notes?
