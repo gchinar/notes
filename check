@@ -1,336 +1,414 @@
+# AWS Services Verification — Command Reference
 
-Three principles before the checklist:
+Companion to the EKS command reference. Covers the managed services behind the portal.
 
-- **Understand before you verify.** You can't confirm something works if you don't know what "working" looks like.
-- **Confirm which environment you're touching, and start read-only.** This portal *controls physical appliances* — an accidental control command in prod could literally actuate a customer's device. Never run mutating checks in prod until you know they're safe.
-- The control path deserves extra scrutiny (more below).
+> ⚠️ **Confirm your AWS account and region before every session** (`aws sts get-caller-identity`). Everything here is **read-only** — no `create`, `modify`, `delete`, `reboot`, or `failover` calls. Replace `<placeholders>` with real values.
 
-**Step 0 — before you touch anything.** This is the highest-leverage move, and asking for it signals maturity, not weakness. Get the existing architecture diagrams, runbooks, and any prior environment verification plans, and find out what's already been verified vs. what's outstanding so you don't reinvent or duplicate. Secure read-only access to the AWS console, `kubectl`, the ArgoCD UI, the repos, and the observability dashboards. Then draw the architecture yourself — data flow *and* control flow. That becomes your map.
-
-Then work the layers:
-
-**1. Infrastructure**
-- EKS: nodes Ready, capacity headroom, autoscaling configured
-- Pods: no CrashLoopBackOff or excessive restarts; resource requests + limits set; liveness/readiness/startup probes defined
-- RDS MySQL: connectivity from pods, Multi-AZ, automated backups + retention, sane connection-pool sizing
-- Redis: connectivity, auth/TLS, persistence-vs-cache intent, eviction policy, memory headroom
-- Kafka: broker health, topic replication factor ≥3 with `min.insync.replicas`, partition counts, retention
-- ALB / CloudFront / S3: target health, routing rules, valid TLS certs, correct origins/cache behavior, S3 not unintentionally public
-
-**2. Deployment (ArgoCD + K8s)**
-- All Argo apps Synced *and* Healthy, no `OutOfSync` drift
-- Image tags pinned to a release (not `latest`); target revision points at the prod version
-- HPA, PodDisruptionBudgets, network policies present; secrets via a proper mechanism, not plaintext manifests
-
-**3. Backend services (each Spring Boot API)**
-- Actuator health endpoints green; prod profile active with no dev config/endpoints leaking; DB migrations (Flyway/Liquibase) applied
-- OAuth API: token issuance, validation, expiry, refresh, revocation, correct scopes/claims, JWKS/key rotation, clock-skew tolerance
-- Stream API (SSE): connection establishes, events arrive with low latency, reconnection/backpressure behave — and check that ALB/CloudFront idle timeouts don't kill long-lived SSE connections and responses aren't buffered. This is a classic failure that only shows up in prod.
-- Main data/control API: CRUD, input validation, authorization enforced, rate limiting, and control commands that are idempotent + audit-logged
-
-**4. Event processing (Kafka)**
-- Consumers attached to the right topics, consuming, lag near zero
-- Account/queue handlers processing correctly; retries + dead-letter handling; offset management with no loss or reprocessing
-
-**5. Frontend**
-- React app loads via CloudFront, correct build/version, points at prod APIs (not dev), no console errors, auth redirect works, CSP headers present
-- Legacy frontend still loads and functions against the legacy API
-
-**6. End-to-end — the real test.** Walk a full agent journey and confirm each hop: log in (OAuth) → view a device → see real-time state via SSE → run a diagnostic → send a control command → device responds → state update reflects it → audit log records who/what/when/which device. Do this for both the new and legacy user-facing paths.
-
-Three cross-cutting things worth calling out separately:
-
-*Security and the control path* — the biggest risk here. Authorization scoped so an agent can only see/control permitted devices; every control action audit-logged, rate-limited, with fail-safe behavior when a device is offline or a command half-delivers; TLS in transit everywhere, least-privilege IAM (IRSA for pods), no hardcoded secrets, dependency and container image scanning.
-
-*Observability* — if you can't see it, you can't claim it's healthy. Logs flowing and structured; dashboards for the golden signals (latency, traffic, errors, saturation); correlation IDs across services; and actually test that one alert fires to the right place. Add SSE connection-count and Kafka consumer-lag alerts specifically.
-
-*Resilience* — verify, don't assume. Kill a pod and confirm recovery; trigger RDS/Redis failover; drop a Kafka broker; check what happens when Kafka or Redis is fully down. Crucially, prove a backup restore actually works and that rollback via ArgoCD is clean.
-
-# EKS Verification — Command Reference
-
-Portal: remote diagnose/monitor/**control** of customer appliances.
-
-> ⚠️ **This portal can actuate physical devices.** Confirm your cluster/context and the environment **before every session**. Everything in sections 0–14 is **read-only**. Section 15 contains **mutating / resilience** commands — do not run those in prod without sign-off.
-
-**Convention:** replace placeholders `<cluster>`, `<region>`, `<namespace>`, `<pod>`, `<name>`, `<label>` with real values. Set `export NS=<namespace>` once and reuse.
-
----
-
-## 0. Confirm identity & cluster (do this first, every time)
-
+For CloudWatch time ranges below, set:
 ```bash
-kubectl config current-context          # WHICH cluster am I on?
-kubectl config get-contexts             # all contexts; note the * marker
-aws sts get-caller-identity             # which AWS account/role
-aws eks describe-cluster --name <cluster> --region <region> \
-  --query 'cluster.{status:status,version:version,endpoint:endpoint,platform:platformVersion}'
-
-# (Re)point kubeconfig if needed — only edits local config, safe
-aws eks update-kubeconfig --name <cluster> --region <region>
-```
-
-If `current-context` isn't unmistakably the environment you intend, **stop** and fix it before running anything else.
-
----
-
-## 1. Fast triage snapshot
-
-Run these first for a 30-second health read, then dig into whatever looks off.
-
-```bash
-kubectl get nodes -o wide
-kubectl get pods -A | grep -Ev '([0-9]+)/\1' | grep -vE 'Completed|Running'   # pods NOT fully ready
-kubectl get events -A --sort-by=.lastTimestamp | tail -40                     # recent cluster events
-kubectl top nodes                                                             # needs metrics-server
+export START=$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)   # macOS: date -u -v-1H ...
+export END=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 ```
 
 ---
 
-## 2. Cluster & node health
+## 1. RDS MySQL
 
 ```bash
-kubectl version                                  # client/server skew
-kubectl get nodes -o wide
-kubectl get nodes -o custom-columns=\
-NAME:.metadata.name,STATUS:.status.conditions[-1].type,\
-KUBELET:.status.nodeInfo.kubeletVersion,INSTANCE:.metadata.labels.node\.kubernetes\.io/instance-type
+# Core config: status, engine, HA, encryption, exposure
+aws rds describe-db-instances --db-instance-identifier <id> \
+  --query 'DBInstances[0].{Status:DBInstanceStatus,Engine:Engine,Version:EngineVersion,\
+Class:DBInstanceClass,MultiAZ:MultiAZ,Encrypted:StorageEncrypted,\
+Public:PubliclyAccessible,DeletionProtection:DeletionProtection}'
 
-kubectl describe nodes | grep -E 'Name:|Taints:|MemoryPressure|DiskPressure|PIDPressure|Ready'
-kubectl top nodes                                # CPU/mem headroom per node
+# Backups & recovery point
+aws rds describe-db-instances --db-instance-identifier <id> \
+  --query 'DBInstances[0].{Retention:BackupRetentionPeriod,Window:PreferredBackupWindow,\
+LatestRestorable:LatestRestorableTime}'
+
+# Recent automated snapshots exist
+aws rds describe-db-snapshots --db-instance-identifier <id> --snapshot-type automated \
+  --query 'reverse(sort_by(DBSnapshots,&SnapshotCreateTime))[:5].{Id:DBSnapshotIdentifier,Time:SnapshotCreateTime,Status:Status}'
+
+# Live load: connections & CPU
+aws cloudwatch get-metric-statistics --namespace AWS/RDS --metric-name DatabaseConnections \
+  --dimensions Name=DBInstanceIdentifier,Value=<id> \
+  --start-time $START --end-time $END --period 300 --statistics Average Maximum
+aws cloudwatch get-metric-statistics --namespace AWS/RDS --metric-name CPUUtilization \
+  --dimensions Name=DBInstanceIdentifier,Value=<id> \
+  --start-time $START --end-time $END --period 300 --statistics Average Maximum
 ```
 
-Look for: all nodes `Ready`, no `*Pressure` conditions, uniform kubelet versions, capacity to reschedule a lost node.
+**Look for:** `available`; **Multi-AZ true** in prod; encrypted at rest; `PubliclyAccessible false`; deletion protection on; backup retention adequate (e.g. 7–35 days) with a recent `LatestRestorableTime`; connection count well below `max_connections`; the DB security group allows **only the app security group** on 3306 (see §9).
 
 ---
 
-## 3. Namespaces & overall workload state
+## 2. ElastiCache / Redis
 
 ```bash
-kubectl get ns
-export NS=<namespace>
+# If using a replication group (cluster mode or replicas)
+aws elasticache describe-replication-groups --replication-group-id <id> \
+  --query 'ReplicationGroups[0].{Status:Status,MultiAZ:MultiAZ,AutoFailover:AutomaticFailover,\
+AtRest:AtRestEncryptionEnabled,InTransit:TransitEncryptionEnabled,AuthToken:AuthTokenEnabled,\
+Nodes:MemberClusters}'
 
-kubectl get all -n $NS
-kubectl get pods -n $NS -o wide
+# Or standalone cache clusters
+aws elasticache describe-cache-clusters --show-cache-node-info \
+  --query 'CacheClusters[*].{Id:CacheClusterId,Status:CacheClusterStatus,\
+Engine:Engine,Version:EngineVersion,Node:CacheNodeType}'
 
-# Problem pods
-kubectl get pods -n $NS --field-selector=status.phase!=Running
-# Flapping / crashlooping — sort by restart count
-kubectl get pods -n $NS --sort-by='.status.containerStatuses[0].restartCount'
+# Memory pressure, evictions, connections
+aws cloudwatch get-metric-statistics --namespace AWS/ElastiCache --metric-name DatabaseMemoryUsagePercentage \
+  --dimensions Name=ReplicationGroupId,Value=<id> \
+  --start-time $START --end-time $END --period 300 --statistics Average Maximum
+aws cloudwatch get-metric-statistics --namespace AWS/ElastiCache --metric-name Evictions \
+  --dimensions Name=ReplicationGroupId,Value=<id> \
+  --start-time $START --end-time $END --period 300 --statistics Sum
 ```
 
-Look for: zero `CrashLoopBackOff`/`ImagePullBackOff`/`Pending`, low restart counts, all containers `READY n/n`.
+**Look for:** `available`; automatic failover + Multi-AZ enabled in prod; encryption in transit **and** at rest; auth token enabled; **evictions near zero**; memory headroom; the intended `maxmemory-policy` for your use (cache-only vs. data you can't lose). Redis SG open only to the app SG on 6379.
 
 ---
 
-## 4. Deployments & rollouts
+## 3. MSK / Kafka
 
 ```bash
-kubectl get deploy,sts,ds -n $NS
+# Find the cluster ARN
+aws kafka list-clusters \
+  --query 'ClusterInfoList[*].{Name:ClusterName,ARN:ClusterArn,State:State,Version:CurrentBrokerSoftwareInfo.KafkaVersion}'
 
-# Desired vs available replicas at a glance
-kubectl get deploy -n $NS -o custom-columns=\
-NAME:.metadata.name,DESIRED:.spec.replicas,READY:.status.readyReplicas,AVAIL:.status.availableReplicas,UPTODATE:.status.updatedReplicas
+# Cluster detail
+aws kafka describe-cluster --cluster-arn <arn> \
+  --query 'ClusterInfo.{State:State,Brokers:NumberOfBrokerNodes,\
+Encryption:EncryptionInfo.EncryptionInTransit,Monitoring:EnhancedMonitoring}'
 
-kubectl rollout status deploy/<name> -n $NS
-kubectl rollout history deploy/<name> -n $NS
-
-# Full spec: probes, resources, limits, strategy
-kubectl describe deploy/<name> -n $NS
+aws kafka get-bootstrap-brokers --cluster-arn <arn>
 ```
 
-Look for: `DESIRED == READY == AVAIL`, RollingUpdate strategy sane, liveness/readiness/startup probes defined, resource **requests _and_ limits** set.
+Then, from a pod or bastion that has the Kafka CLI tools and network access:
+
+```bash
+BS=<broker1:9092,broker2:9092,...>
+kafka-topics.sh --bootstrap-server $BS --list
+kafka-topics.sh --bootstrap-server $BS --describe --topic <topic>        # ReplicationFactor, Isr
+kafka-consumer-groups.sh --bootstrap-server $BS --list
+kafka-consumer-groups.sh --bootstrap-server $BS --describe --group <group>   # the LAG column
+```
+
+**Look for:** cluster `ACTIVE`; ≥3 brokers; **replication factor ≥3** and `min.insync.replicas ≥2`; **ISR count == replica count** (no under-replicated partitions); **consumer lag near zero and not growing** across the account/queue handler groups; encryption in transit on. A steadily rising lag means consumers can't keep up — investigate before go-live.
 
 ---
 
-## 5. Image tags — confirm a pinned release, not `latest`
+## 4. Application Load Balancer
 
 ```bash
-kubectl get pods -n $NS -o jsonpath=\
-'{range .items[*]}{.metadata.name}{"\t"}{.spec.containers[*].image}{"\n"}{end}'
+# Find the LB
+aws elbv2 describe-load-balancers \
+  --query 'LoadBalancers[*].{Name:LoadBalancerName,ARN:LoadBalancerArn,DNS:DNSName,State:State.Code,Scheme:Scheme}'
 
-# Just the unique images running in the namespace
-kubectl get pods -n $NS -o jsonpath='{.items[*].spec.containers[*].image}' \
-  | tr ' ' '\n' | sort -u
+# Target health — the single most important ALB check
+aws elbv2 describe-target-groups --load-balancer-arn <lb-arn> \
+  --query 'TargetGroups[*].{Name:TargetGroupName,ARN:TargetGroupArn,Port:Port,HealthPath:HealthCheckPath}'
+aws elbv2 describe-target-health --target-group-arn <tg-arn> \
+  --query 'TargetHealthDescriptions[*].{Target:Target.Id,Port:Target.Port,State:TargetHealth.State,Reason:TargetHealth.Reason}'
+
+# Listeners & TLS
+aws elbv2 describe-listeners --load-balancer-arn <lb-arn> \
+  --query 'Listeners[*].{Port:Port,Protocol:Protocol,Cert:Certificates[0].CertificateArn}'
+aws elbv2 describe-rules --listener-arn <listener-arn>
+
+# Idle timeout — matters for SSE / Stream API
+aws elbv2 describe-load-balancer-attributes --load-balancer-arn <lb-arn> \
+  --query "Attributes[?Key=='idle_timeout.timeout_seconds' || Key=='access_logs.s3.enabled' || Key=='deletion_protection.enabled']"
 ```
 
-Every image should carry an explicit version/digest matching your intended prod release. `:latest` or unexpected tags are a red flag.
+**Look for:** all targets `healthy`; an HTTPS (443) listener with a valid ACM cert; HTTP→HTTPS redirect; **idle timeout long enough** for long-lived SSE connections (or your SSE pattern accounts for it); access logs enabled; deletion protection on; listener rules routing to the correct target groups (main API / stream / OAuth / legacy).
 
 ---
 
-## 6. Per-service deep dive (repeat for each API + frontend)
+## 5. CloudFront
 
 ```bash
-kubectl describe pod <pod> -n $NS               # events, probe results, mounts, why-not-scheduled
-kubectl logs <pod> -n $NS --tail=100
-kubectl logs <pod> -n $NS --previous            # logs from the last crash, if any
-kubectl logs -l app=<label> -n $NS --tail=50    # aggregate across replicas
-kubectl top pods -n $NS
+aws cloudfront list-distributions \
+  --query 'DistributionList.Items[*].{Id:Id,Domain:DomainName,Status:Status,Enabled:Enabled,\
+Aliases:Aliases.Items,Origins:Origins.Items[*].DomainName}'
 
-# Spring Boot health from inside the pod (read-only)
-kubectl exec <pod> -n $NS -- curl -s localhost:8080/actuator/health | jq .
-kubectl exec <pod> -n $NS -- curl -s localhost:8080/actuator/info   | jq .
+# Full config: behaviors, TTLs, origins, cert, protocol policy
+aws cloudfront get-distribution-config --id <dist-id>
 ```
 
-For the **OAuth API**, confirm health + that it can reach its signing keys. For the **main data/control API**, confirm DB connectivity in the health output (`db` component `UP`). Only run **read** commands inside app pods.
+**Look for:** `Deployed` + `Enabled`; correct alternate domain names (CNAMEs) with an ACM cert **in us-east-1**; viewer protocol policy = redirect-to-HTTPS; origins correct (S3 for static assets, ALB for APIs); cache behaviors that **do not cache authenticated API or SSE responses** (forward auth headers, disable caching on those paths); Origin Access Control (OAC) for the S3 origin so the bucket isn't public; a response-headers policy (security headers) and WAF association if expected.
 
 ---
 
-## 7. Config & secrets (verify wiring, not values)
+## 6. S3 (static assets)
 
 ```bash
-kubectl get configmap -n $NS
-kubectl get secret -n $NS                        # names/types only — do NOT dump values
+aws s3 ls
 
-# What config/env does a deployment consume?
-kubectl get deploy/<name> -n $NS -o jsonpath='{.spec.template.spec.containers[*].envFrom}' | jq .
-kubectl get deploy/<name> -n $NS -o jsonpath='{.spec.template.spec.containers[*].env}'     | jq .
+# Public access block — critical
+aws s3api get-public-access-block --bucket <bucket>
 
-# If using External Secrets / Sealed Secrets, confirm they're synced
-kubectl get externalsecrets -A 2>/dev/null
-kubectl get sealedsecrets -A 2>/dev/null
+# Policy & ACL — confirm not world-readable
+aws s3api get-bucket-policy --bucket <bucket> --query 'Policy' --output text 2>/dev/null | jq .
+aws s3api get-bucket-acl --bucket <bucket>
+
+# Encryption & versioning
+aws s3api get-bucket-encryption --bucket <bucket>
+aws s3api get-bucket-versioning --bucket <bucket>
 ```
 
-Confirm secrets are sourced from a real backend (External Secrets, Sealed Secrets, SSM/Secrets Manager) — not committed plaintext. **Never** `kubectl get secret -o yaml` a prod secret into a shared log.
+**Look for:** all four public-access-block flags `true` (with CloudFront serving via OAC); default encryption enabled; versioning enabled (lets you roll back a bad asset deploy); bucket policy grants read **only** to the CloudFront OAC principal — no `"Principal":"*"` public reads.
 
 ---
 
-## 8. Networking — services, ingress, endpoints
+## 7. ACM certificates
 
 ```bash
-kubectl get svc -n $NS -o wide
-kubectl get ingress -n $NS
-kubectl describe ingress <name> -n $NS           # ALB rules, listener/target config
-
-# Are services actually backed by READY pods? Empty endpoints = broken service
-kubectl get endpoints -n $NS
-kubectl get endpointslices -n $NS
-
-kubectl get networkpolicy -n $NS                 # confirm expected isolation exists
+aws acm list-certificates --query 'CertificateSummaryList[*].{Domain:DomainName,ARN:CertificateArn}'
+aws acm describe-certificate --certificate-arn <arn> \
+  --query 'Certificate.{Status:Status,NotAfter:NotAfter,Renewal:RenewalEligibility,InUse:InUseBy}'
 ```
 
-Empty `ENDPOINTS` on a service that should have backends is a classic silent failure — the pod is up but not passing readiness.
+**Look for:** `ISSUED`; `NotAfter` comfortably in the future; auto-renewal eligible; each cert actually `InUseBy` the expected ALB/CloudFront. Remember CloudFront certs must live in **us-east-1**; ALB certs in the ALB's region.
 
 ---
 
-## 9. In-cluster connectivity test (ephemeral pod, auto-deletes)
+## 8. WAF (if in use)
 
 ```bash
-kubectl run nettest --rm -it --image=nicolaka/netshoot -n $NS -- bash
-# then inside the throwaway pod:
-#   curl -s http://<svc>.<ns>.svc.cluster.local:<port>/actuator/health
-#   nslookup <svc>.<ns>.svc.cluster.local
-#   nc -vz <svc> <port>
+aws wafv2 list-web-acls --scope CLOUDFRONT --region us-east-1     # for CloudFront
+aws wafv2 list-web-acls --scope REGIONAL --region <region>        # for the ALB
+aws wafv2 get-web-acl --scope <scope> --region <region> --name <name> --id <id> \
+  --query 'WebACL.Rules[*].{Name:Name,Action:Action,Priority:Priority}'
 ```
 
-The `--rm` flag deletes the pod on exit. Use this to prove service-to-service DNS and reachability without touching app pods.
-
-### SSE / Stream API check
-From the netshoot pod, hit the stream endpoint and confirm events flow **and the connection stays open**:
-```bash
-#   curl -N http://<stream-svc>.<ns>.svc.cluster.local:<port>/<sse-path>
-```
-`-N` disables buffering. If events arrive in-cluster but not through CloudFront/ALB, suspect idle-timeout or response buffering at the edge — verify those separately.
+**Look for:** a Web ACL actually associated with the CloudFront distribution and/or ALB; managed rule groups enabled; rate-based rules present given this app controls physical devices.
 
 ---
 
-## 10. Autoscaling & disruption budgets
+## 9. Networking — security groups & VPC (least privilege)
 
 ```bash
-kubectl get hpa -n $NS
-kubectl describe hpa <name> -n $NS               # current vs target metrics, whether it can scale
-kubectl get pdb -n $NS                           # PodDisruptionBudgets protect availability
+# Inbound rules for the data-store SGs
+aws ec2 describe-security-groups --group-ids <rds-sg> <redis-sg> <msk-sg> \
+  --query 'SecurityGroups[*].{Name:GroupName,Id:GroupId,Ingress:IpPermissions}'
 
-# Node autoscaler present & healthy?
-kubectl get pods -n kube-system | grep -E 'cluster-autoscaler|karpenter'
+# VPC endpoints (private access to AWS services)
+aws ec2 describe-vpc-endpoints \
+  --query 'VpcEndpoints[*].{Service:ServiceName,State:State,Type:VpcEndpointType}'
 ```
 
-Look for: HPAs reporting real metrics (not `<unknown>`), PDBs present for critical services so drains don't take everything down.
+**Look for:** RDS reachable only from the app SG on 3306, Redis only on 6379, MSK only on its broker ports — **no `0.0.0.0/0`** on any data store. Data stores in private subnets. VPC endpoints for S3/ECR/etc. if you're keeping traffic off the public internet.
 
 ---
 
-## 11. Load balancer controller & target group wiring
+## 10. IAM / IRSA (pod permissions)
 
 ```bash
-kubectl get pods -n kube-system | grep aws-load-balancer
-kubectl get targetgroupbindings -A              # links K8s svc → AWS target group
-kubectl describe ingress <name> -n $NS | grep -iA2 address    # the ALB DNS name
+aws iam get-role --role-name <irsa-role> \
+  --query 'Role.{Name:RoleName,Trust:AssumeRolePolicyDocument}'
+aws iam list-attached-role-policies --role-name <irsa-role>
+aws iam list-role-policies --role-name <irsa-role>
 ```
 
-Cross-check the ALB target group in the AWS console shows **healthy** targets matching your ready pods.
+**Look for:** the trust policy scoped to the cluster's OIDC provider **and** a specific namespace/service account (not a wildcard); attached policies scoped to only the resources that service needs (specific S3 bucket, specific secrets) rather than `*`.
 
 ---
 
-## 12. IRSA / pod IAM (least privilege)
+## 11. Secrets & parameters
 
 ```bash
-kubectl get sa -n $NS
-kubectl describe sa <serviceaccount> -n $NS      # look for eks.amazonaws.com/role-arn annotation
-
-# Which SA does each pod run as?
-kubectl get pods -n $NS -o custom-columns=\
-POD:.metadata.name,SA:.spec.serviceAccountName
+aws secretsmanager list-secrets \
+  --query 'SecretList[*].{Name:Name,Rotation:RotationEnabled,LastChanged:LastChangedDate}'
+aws ssm describe-parameters \
+  --query 'Parameters[*].{Name:Name,Type:Type,LastModified:LastModifiedDate}'
 ```
 
-Pods needing AWS access (S3, RDS via IAM auth, etc.) should use IRSA-annotated service accounts — not node instance roles or static keys.
+**Look for:** DB/Redis/OAuth credentials stored here (not in manifests or images); rotation enabled where feasible; `SecureString` for SSM params. **Do not print secret values** into shared logs.
 
 ---
 
-## 13. Storage & certificates (if applicable)
+## 12. Observability & alarms
 
 ```bash
-kubectl get pvc -n $NS
-kubectl get pv
-kubectl get storageclass
+# Alarm inventory and current state
+aws cloudwatch describe-alarms \
+  --query 'MetricAlarms[*].{Name:AlarmName,State:StateValue,Metric:MetricName,Namespace:Namespace}' --output table
 
-# If cert-manager manages TLS
-kubectl get certificate -A
-kubectl get certificaterequest -A
-kubectl describe certificate <name> -n $NS       # confirm Ready=True, not expiring soon
+# Blind spots: alarms with no data
+aws cloudwatch describe-alarms --state-value INSUFFICIENT_DATA \
+  --query 'MetricAlarms[*].AlarmName'
+
+# Currently firing
+aws cloudwatch describe-alarms --state-value ALARM \
+  --query 'MetricAlarms[*].AlarmName'
+
+# Log groups exist and retain sensibly
+aws logs describe-log-groups \
+  --query 'logGroups[*].{Name:logGroupName,Retention:retentionInDays,Stored:storedBytes}' --output table
+```
+
+**Look for:** alarms covering RDS (CPU/connections/storage), Redis (memory/evictions), MSK (consumer lag/under-replicated partitions), ALB (5xx/target health/latency), CloudFront (5xx error rate); **no critical alarms stuck in `INSUFFICIENT_DATA`** (that's a monitoring blind spot); alarm actions wired to a real SNS topic; log groups with a defined retention (not "never expire" by accident, not too short).
+
+---
+
+## 13. DNS (Route 53)
+
+```bash
+aws route53 list-hosted-zones --query 'HostedZones[*].{Name:Name,Id:Id}'
+aws route53 list-resource-record-sets --hosted-zone-id <zone-id> \
+  --query 'ResourceRecordSets[?Type==`A` || Type==`CNAME`].{Name:Name,Type:Type,Target:AliasTarget.DNSName}'
+```
+
+**Look for:** the portal's records resolve to the correct CloudFront distribution / ALB; alias records rather than hardcoded IPs; health checks attached if you use DNS failover.
+
+---
+
+# Portal UI Verification — Checklist
+
+Manual walkthrough of the portal in the browser. Record **pass / fail + evidence** (screenshot, DevTools capture, correlation ID) for each item.
+
+> ⚠️ **The control path actuates real appliances.** Do every control/diagnostic test against a **designated TEST device only** — never a live customer appliance. Confirm which environment and which device you're pointed at before you click anything that sends a command.
+
+Tools you'll use throughout: browser **DevTools** → Network, Console, Application (cookies/storage) tabs. A couple of quick shell checks are included where faster.
+
+---
+
+## 1. Load & delivery
+
+- Portal loads at the correct **prod URL** over **HTTPS** (valid cert, no browser warning).
+- No **mixed-content** warnings; no errors in the **Console** tab on load.
+- Static assets (JS/CSS/images) load from CloudFront/S3, not a dev origin — check the **Network** tab domains.
+- Correct **build/version** is live (check a version string, `/version` endpoint, or build hash in asset filenames) — confirm it matches the intended release.
+- Page title, favicon, and branding are the production ones (not staging).
+
+```bash
+# Security & cache headers in one shot
+curl -sI https://<portal-url> | grep -iE \
+ 'strict-transport-security|content-security-policy|x-frame-options|x-content-type-options|referrer-policy|cache-control|server'
 ```
 
 ---
 
-## 14. ArgoCD — sync & drift (read-only)
+## 2. Authentication (OAuth)
 
-```bash
-argocd app list
-argocd app get <app>
-argocd app diff <app>                            # shows live-vs-desired drift; does NOT change anything
-
-# Or via kubectl if you can't use the CLI
-kubectl get applications -n argocd -o custom-columns=\
-NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status
-```
-
-Every app should be **Synced** and **Healthy** with no drift. `OutOfSync` means live state diverges from Git — investigate before go-live.
+- Hitting the portal while logged out **redirects to the OAuth login**.
+- Valid credentials log in and land on the expected home/dashboard.
+- **Refreshing the page keeps you logged in** (session persists).
+- **Token refresh** works — stay past the access-token lifetime and confirm the session continues without a hard re-login (watch the Network tab for a refresh call).
+- **Expired/invalid token** is handled gracefully (clean redirect to login, not a white screen or a raw error).
+- **Logout** clears the session; hitting a back button or deep link afterward doesn't restore access.
+- **Deep-link protection:** pasting an authenticated URL while logged out redirects to login rather than exposing the page.
+- **Authorization / RBAC:** an agent sees and can act on **only the devices/actions their role permits**. Try (in a test account) to reach a device outside scope and confirm it's blocked — this is the most security-critical UI check for a device-control portal.
 
 ---
 
-## 15. ⚠️ Mutating / resilience tests — NOT read-only
+## 3. Navigation & core pages
 
-Do **not** run these in production without explicit sign-off and a maintenance window. They change cluster state. Verify recovery behavior in a lower environment first, then repeat in prod only if your runbook calls for it.
-
-```bash
-# Kill a pod, confirm it reschedules and traffic recovers
-kubectl delete pod <pod> -n $NS
-
-# Restart a deployment (rolling)
-kubectl rollout restart deploy/<name> -n $NS
-
-# Roll back a deployment to the previous revision
-kubectl rollout undo deploy/<name> -n $NS
-
-# Cordon/drain a node (resilience test) — reschedules everything off it
-kubectl cordon <node>
-kubectl drain <node> --ignore-daemonsets --delete-emptydir-data
-kubectl uncordon <node>                          # restore when done
-```
-
-**Never** issue device-control commands as part of resilience testing — use synthetic/test devices or a non-prod environment for anything that reaches the appliance control path.
+- All primary nav links resolve — no dead ends or 404s.
+- **Device list** loads; search, filter, sort, and pagination behave on a realistic data volume.
+- **Device detail** page opens and shows current state.
+- Deep-linking to a specific device by URL works and respects auth/RBAC.
+- Browser **back/forward** behaves; refreshing a deep page doesn't break routing (SPA route handling).
 
 ---
 
-## Turning this into a deliverable
+## 4. Real-time updates (Stream API / SSE)
 
-For each section, record **pass/fail + evidence** (command output, ALB target-group screenshot, ArgoCD dashboard link). Close with a go/no-go summary and a pointer to the rollback runbook. That artifact is what demonstrates the verification actually happened.
+- On a device detail page, **state updates appear live** without a manual refresh.
+- **Latency** between an actual state change (on a test device) and the UI reflecting it is acceptable.
+- The stream **survives an idle period** — leave the page open several minutes and confirm updates still arrive (this catches ALB/CloudFront idle-timeout and edge-buffering issues that only appear in prod).
+- **Reconnection:** toggle your network off/on (DevTools → Network → Offline) and confirm the stream reconnects and resumes without a full reload.
+- Open the device in **two tabs** and confirm both receive updates consistently.
+- Check the **Network** tab: the SSE/EventStream connection is open and receiving events (not repeatedly failing and retrying).
 
+---
+
+## 5. Diagnostics
+
+- Run a diagnostic against a **test device**; results render correctly.
+- **Loading state** shows while it runs; **error state** shows cleanly if it fails or times out.
+- Results reflect real device data (cross-check against a known value).
+
+---
+
+## 6. Control path — highest caution ⚠️
+
+Use a **designated test appliance**. Never issue control commands to a real customer device during verification.
+
+- A control command from the UI **reaches the test device** and the device responds.
+- The resulting **state change flows back** and the UI updates (ties into §4).
+- **Confirmation UX:** destructive/impactful actions require a confirm step; there's clear feedback on success/failure.
+- **Offline device:** controls are disabled or clearly error when the device is offline, rather than silently appearing to succeed.
+- **Partial/failed delivery:** simulate a command that doesn't complete and confirm the UI communicates the true state (no false "success").
+- **Guardrails:** rate limiting / bulk-action confirmation exist so an accidental click can't actuate many devices at once.
+- **Permission enforcement:** an agent cannot send a control command to a device outside their authorized scope.
+- **Audit trail:** every control action is recorded with **who** (agent identity), **what** (command), **when** (timestamp), and **which device** — verify the entry actually appears after your test action.
+
+---
+
+## 7. Legacy frontend
+
+- The legacy UI **loads and functions** against the legacy API.
+- **Auth** works for legacy (either its own login or SSO bridged from the new OAuth) — no separate broken login.
+- Whatever functionality legacy still owns has **parity / correctness** for those flows.
+- Navigation **between new and legacy** (if linked) works with no broken hand-offs or auth loss.
+
+---
+
+## 8. Error handling & resilience (user-facing)
+
+- Simulate an **API failure** (e.g. block the API host in DevTools) and confirm the UI shows a graceful error, not a blank screen.
+- **401 / 403 / 404 / 500** conditions each produce a sensible page or message.
+- **Form validation:** invalid input is caught client-side with clear messages; server-side validation errors surface readably.
+- **Timeouts** are handled (spinner doesn't hang forever; a retry or error appears).
+
+---
+
+## 9. Client-side security
+
+- **Response headers** present (from §1 curl or the Network tab): `Strict-Transport-Security`, `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, a frame-protection header (`X-Frame-Options` / CSP `frame-ancestors`), `Referrer-Policy`.
+- **Cookies** (Application → Cookies): session cookies are `HttpOnly`, `Secure`, and have a sensible `SameSite`.
+- **No secrets in the client:** search the JS bundle and Console for tokens, API keys, or credentials; none should be hardcoded.
+- **No sensitive data in URLs** (tokens/PII shouldn't ride in query strings that land in logs/history).
+- **Token storage:** confirm where the access token lives and that it's appropriate for your threat model (e.g. not a long-lived token sitting in `localStorage` if that's a concern for your team).
+- **CORS** behaves — the app's own calls succeed; cross-origin calls that should be blocked are blocked.
+
+---
+
+## 10. Cross-browser & responsive
+
+- Works in the browsers agents actually use (**Chrome, Firefox, Safari, Edge**).
+- If agents use tablets/phones, verify **responsive layouts** and touch interactions.
+- Reasonable behavior at different **zoom levels** and screen resolutions.
+
+---
+
+## 11. Performance (user-perceived)
+
+- Initial load time is acceptable on a representative connection; run a **Lighthouse** pass for a baseline.
+- **Long-session stability:** leave a device page with a live SSE stream open for a while and watch **memory** in DevTools — a steadily climbing heap suggests a leak in the stream handling.
+- Large device lists render and scroll without freezing.
+
+---
+
+## 12. Accessibility (if in scope)
+
+- **Keyboard navigation** reaches all interactive elements with visible focus states.
+- Form fields have **labels**; images have alt text.
+- **Color contrast** meets AA for text and key UI.
+- Landmarks/roles present for screen-reader users.
+
+---
+
+## 13. Observability from the user side
+
+- **Trigger a deliberate error** in the UI and confirm it appears in your logging/monitoring with a **correlation ID** you can trace back through the APIs.
+- If a frontend error tracker (Sentry / RUM) is expected, confirm events actually arrive.
+
+---
+
+## Roll it up
+
+Summarize as pass/fail with evidence, and flag any **auth/RBAC gap, control-path safety gap, or false-success behavior** prominently in the go/no-go — those are the failures that matter most on a portal that controls physical devices.
