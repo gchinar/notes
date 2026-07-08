@@ -1,414 +1,195 @@
-# AWS Services Verification — Command Reference
+# Post-Deployment PROD Verification — Runbook
 
-Companion to the EKS command reference. Covers the managed services behind the portal.
+Run **after** the prod deploy + Route53 URL change. Ordered as a live smoke test: verify the thing that just changed (DNS/URL) first, then work edge → app → data → user journey.
 
-> ⚠️ **Confirm your AWS account and region before every session** (`aws sts get-caller-identity`). Everything here is **read-only** — no `create`, `modify`, `delete`, `reboot`, or `failover` calls. Replace `<placeholders>` with real values.
+> ⚠️ **This is production and the portal actuates real appliances. Everything here is READ-ONLY.** Do **not** send control commands, do **not** run resilience/failover tests, do **not** write data as part of this verification. Deeper per-domain checks live in the EKS / AWS-services / UI references — this runbook cross-references them.
 
-For CloudWatch time ranges below, set:
+Set your variables once:
 ```bash
-export START=$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)   # macOS: date -u -v-1H ...
+export URL=<new-portal-hostname>        # e.g. portal.example.com (the newly changed Route53 record)
+export NS=<prod-namespace>
+export START=$(date -u -d '20 min ago' +%Y-%m-%dT%H:%M:%SZ)   # macOS: date -u -v-20M ...
 export END=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 ```
 
 ---
 
-## 1. RDS MySQL
+## 0. Confirm you're in PROD (do this first)
 
 ```bash
-# Core config: status, engine, HA, encryption, exposure
-aws rds describe-db-instances --db-instance-identifier <id> \
-  --query 'DBInstances[0].{Status:DBInstanceStatus,Engine:Engine,Version:EngineVersion,\
-Class:DBInstanceClass,MultiAZ:MultiAZ,Encrypted:StorageEncrypted,\
-Public:PubliclyAccessible,DeletionProtection:DeletionProtection}'
-
-# Backups & recovery point
-aws rds describe-db-instances --db-instance-identifier <id> \
-  --query 'DBInstances[0].{Retention:BackupRetentionPeriod,Window:PreferredBackupWindow,\
-LatestRestorable:LatestRestorableTime}'
-
-# Recent automated snapshots exist
-aws rds describe-db-snapshots --db-instance-identifier <id> --snapshot-type automated \
-  --query 'reverse(sort_by(DBSnapshots,&SnapshotCreateTime))[:5].{Id:DBSnapshotIdentifier,Time:SnapshotCreateTime,Status:Status}'
-
-# Live load: connections & CPU
-aws cloudwatch get-metric-statistics --namespace AWS/RDS --metric-name DatabaseConnections \
-  --dimensions Name=DBInstanceIdentifier,Value=<id> \
-  --start-time $START --end-time $END --period 300 --statistics Average Maximum
-aws cloudwatch get-metric-statistics --namespace AWS/RDS --metric-name CPUUtilization \
-  --dimensions Name=DBInstanceIdentifier,Value=<id> \
-  --start-time $START --end-time $END --period 300 --statistics Average Maximum
+aws sts get-caller-identity            # correct prod account?
+kubectl config current-context         # correct prod cluster?
 ```
 
-**Look for:** `available`; **Multi-AZ true** in prod; encrypted at rest; `PubliclyAccessible false`; deletion protection on; backup retention adequate (e.g. 7–35 days) with a recent `LatestRestorableTime`; connection count well below `max_connections`; the DB security group allows **only the app security group** on 3306 (see §9).
+If either isn't unmistakably production, stop and fix your context before continuing.
 
 ---
 
-## 2. ElastiCache / Redis
+## 1. DNS / Route 53 — the change you just made
 
 ```bash
-# If using a replication group (cluster mode or replicas)
-aws elasticache describe-replication-groups --replication-group-id <id> \
-  --query 'ReplicationGroups[0].{Status:Status,MultiAZ:MultiAZ,AutoFailover:AutomaticFailover,\
-AtRest:AtRestEncryptionEnabled,InTransit:TransitEncryptionEnabled,AuthToken:AuthTokenEnabled,\
-Nodes:MemberClusters}'
-
-# Or standalone cache clusters
-aws elasticache describe-cache-clusters --show-cache-node-info \
-  --query 'CacheClusters[*].{Id:CacheClusterId,Status:CacheClusterStatus,\
-Engine:Engine,Version:EngineVersion,Node:CacheNodeType}'
-
-# Memory pressure, evictions, connections
-aws cloudwatch get-metric-statistics --namespace AWS/ElastiCache --metric-name DatabaseMemoryUsagePercentage \
-  --dimensions Name=ReplicationGroupId,Value=<id> \
-  --start-time $START --end-time $END --period 300 --statistics Average Maximum
-aws cloudwatch get-metric-statistics --namespace AWS/ElastiCache --metric-name Evictions \
-  --dimensions Name=ReplicationGroupId,Value=<id> \
-  --start-time $START --end-time $END --period 300 --statistics Sum
-```
-
-**Look for:** `available`; automatic failover + Multi-AZ enabled in prod; encryption in transit **and** at rest; auth token enabled; **evictions near zero**; memory headroom; the intended `maxmemory-policy` for your use (cache-only vs. data you can't lose). Redis SG open only to the app SG on 6379.
-
----
-
-## 3. MSK / Kafka
-
-```bash
-# Find the cluster ARN
-aws kafka list-clusters \
-  --query 'ClusterInfoList[*].{Name:ClusterName,ARN:ClusterArn,State:State,Version:CurrentBrokerSoftwareInfo.KafkaVersion}'
-
-# Cluster detail
-aws kafka describe-cluster --cluster-arn <arn> \
-  --query 'ClusterInfo.{State:State,Brokers:NumberOfBrokerNodes,\
-Encryption:EncryptionInfo.EncryptionInTransit,Monitoring:EnhancedMonitoring}'
-
-aws kafka get-bootstrap-brokers --cluster-arn <arn>
-```
-
-Then, from a pod or bastion that has the Kafka CLI tools and network access:
-
-```bash
-BS=<broker1:9092,broker2:9092,...>
-kafka-topics.sh --bootstrap-server $BS --list
-kafka-topics.sh --bootstrap-server $BS --describe --topic <topic>        # ReplicationFactor, Isr
-kafka-consumer-groups.sh --bootstrap-server $BS --list
-kafka-consumer-groups.sh --bootstrap-server $BS --describe --group <group>   # the LAG column
-```
-
-**Look for:** cluster `ACTIVE`; ≥3 brokers; **replication factor ≥3** and `min.insync.replicas ≥2`; **ISR count == replica count** (no under-replicated partitions); **consumer lag near zero and not growing** across the account/queue handler groups; encryption in transit on. A steadily rising lag means consumers can't keep up — investigate before go-live.
-
----
-
-## 4. Application Load Balancer
-
-```bash
-# Find the LB
-aws elbv2 describe-load-balancers \
-  --query 'LoadBalancers[*].{Name:LoadBalancerName,ARN:LoadBalancerArn,DNS:DNSName,State:State.Code,Scheme:Scheme}'
-
-# Target health — the single most important ALB check
-aws elbv2 describe-target-groups --load-balancer-arn <lb-arn> \
-  --query 'TargetGroups[*].{Name:TargetGroupName,ARN:TargetGroupArn,Port:Port,HealthPath:HealthCheckPath}'
-aws elbv2 describe-target-health --target-group-arn <tg-arn> \
-  --query 'TargetHealthDescriptions[*].{Target:Target.Id,Port:Target.Port,State:TargetHealth.State,Reason:TargetHealth.Reason}'
-
-# Listeners & TLS
-aws elbv2 describe-listeners --load-balancer-arn <lb-arn> \
-  --query 'Listeners[*].{Port:Port,Protocol:Protocol,Cert:Certificates[0].CertificateArn}'
-aws elbv2 describe-rules --listener-arn <listener-arn>
-
-# Idle timeout — matters for SSE / Stream API
-aws elbv2 describe-load-balancer-attributes --load-balancer-arn <lb-arn> \
-  --query "Attributes[?Key=='idle_timeout.timeout_seconds' || Key=='access_logs.s3.enabled' || Key=='deletion_protection.enabled']"
-```
-
-**Look for:** all targets `healthy`; an HTTPS (443) listener with a valid ACM cert; HTTP→HTTPS redirect; **idle timeout long enough** for long-lived SSE connections (or your SSE pattern accounts for it); access logs enabled; deletion protection on; listener rules routing to the correct target groups (main API / stream / OAuth / legacy).
-
----
-
-## 5. CloudFront
-
-```bash
-aws cloudfront list-distributions \
-  --query 'DistributionList.Items[*].{Id:Id,Domain:DomainName,Status:Status,Enabled:Enabled,\
-Aliases:Aliases.Items,Origins:Origins.Items[*].DomainName}'
-
-# Full config: behaviors, TTLs, origins, cert, protocol policy
-aws cloudfront get-distribution-config --id <dist-id>
-```
-
-**Look for:** `Deployed` + `Enabled`; correct alternate domain names (CNAMEs) with an ACM cert **in us-east-1**; viewer protocol policy = redirect-to-HTTPS; origins correct (S3 for static assets, ALB for APIs); cache behaviors that **do not cache authenticated API or SSE responses** (forward auth headers, disable caching on those paths); Origin Access Control (OAC) for the S3 origin so the bucket isn't public; a response-headers policy (security headers) and WAF association if expected.
-
----
-
-## 6. S3 (static assets)
-
-```bash
-aws s3 ls
-
-# Public access block — critical
-aws s3api get-public-access-block --bucket <bucket>
-
-# Policy & ACL — confirm not world-readable
-aws s3api get-bucket-policy --bucket <bucket> --query 'Policy' --output text 2>/dev/null | jq .
-aws s3api get-bucket-acl --bucket <bucket>
-
-# Encryption & versioning
-aws s3api get-bucket-encryption --bucket <bucket>
-aws s3api get-bucket-versioning --bucket <bucket>
-```
-
-**Look for:** all four public-access-block flags `true` (with CloudFront serving via OAC); default encryption enabled; versioning enabled (lets you roll back a bad asset deploy); bucket policy grants read **only** to the CloudFront OAC principal — no `"Principal":"*"` public reads.
-
----
-
-## 7. ACM certificates
-
-```bash
-aws acm list-certificates --query 'CertificateSummaryList[*].{Domain:DomainName,ARN:CertificateArn}'
-aws acm describe-certificate --certificate-arn <arn> \
-  --query 'Certificate.{Status:Status,NotAfter:NotAfter,Renewal:RenewalEligibility,InUse:InUseBy}'
-```
-
-**Look for:** `ISSUED`; `NotAfter` comfortably in the future; auto-renewal eligible; each cert actually `InUseBy` the expected ALB/CloudFront. Remember CloudFront certs must live in **us-east-1**; ALB certs in the ALB's region.
-
----
-
-## 8. WAF (if in use)
-
-```bash
-aws wafv2 list-web-acls --scope CLOUDFRONT --region us-east-1     # for CloudFront
-aws wafv2 list-web-acls --scope REGIONAL --region <region>        # for the ALB
-aws wafv2 get-web-acl --scope <scope> --region <region> --name <name> --id <id> \
-  --query 'WebACL.Rules[*].{Name:Name,Action:Action,Priority:Priority}'
-```
-
-**Look for:** a Web ACL actually associated with the CloudFront distribution and/or ALB; managed rule groups enabled; rate-based rules present given this app controls physical devices.
-
----
-
-## 9. Networking — security groups & VPC (least privilege)
-
-```bash
-# Inbound rules for the data-store SGs
-aws ec2 describe-security-groups --group-ids <rds-sg> <redis-sg> <msk-sg> \
-  --query 'SecurityGroups[*].{Name:GroupName,Id:GroupId,Ingress:IpPermissions}'
-
-# VPC endpoints (private access to AWS services)
-aws ec2 describe-vpc-endpoints \
-  --query 'VpcEndpoints[*].{Service:ServiceName,State:State,Type:VpcEndpointType}'
-```
-
-**Look for:** RDS reachable only from the app SG on 3306, Redis only on 6379, MSK only on its broker ports — **no `0.0.0.0/0`** on any data store. Data stores in private subnets. VPC endpoints for S3/ECR/etc. if you're keeping traffic off the public internet.
-
----
-
-## 10. IAM / IRSA (pod permissions)
-
-```bash
-aws iam get-role --role-name <irsa-role> \
-  --query 'Role.{Name:RoleName,Trust:AssumeRolePolicyDocument}'
-aws iam list-attached-role-policies --role-name <irsa-role>
-aws iam list-role-policies --role-name <irsa-role>
-```
-
-**Look for:** the trust policy scoped to the cluster's OIDC provider **and** a specific namespace/service account (not a wildcard); attached policies scoped to only the resources that service needs (specific S3 bucket, specific secrets) rather than `*`.
-
----
-
-## 11. Secrets & parameters
-
-```bash
-aws secretsmanager list-secrets \
-  --query 'SecretList[*].{Name:Name,Rotation:RotationEnabled,LastChanged:LastChangedDate}'
-aws ssm describe-parameters \
-  --query 'Parameters[*].{Name:Name,Type:Type,LastModified:LastModifiedDate}'
-```
-
-**Look for:** DB/Redis/OAuth credentials stored here (not in manifests or images); rotation enabled where feasible; `SecureString` for SSM params. **Do not print secret values** into shared logs.
-
----
-
-## 12. Observability & alarms
-
-```bash
-# Alarm inventory and current state
-aws cloudwatch describe-alarms \
-  --query 'MetricAlarms[*].{Name:AlarmName,State:StateValue,Metric:MetricName,Namespace:Namespace}' --output table
-
-# Blind spots: alarms with no data
-aws cloudwatch describe-alarms --state-value INSUFFICIENT_DATA \
-  --query 'MetricAlarms[*].AlarmName'
-
-# Currently firing
-aws cloudwatch describe-alarms --state-value ALARM \
-  --query 'MetricAlarms[*].AlarmName'
-
-# Log groups exist and retain sensibly
-aws logs describe-log-groups \
-  --query 'logGroups[*].{Name:logGroupName,Retention:retentionInDays,Stored:storedBytes}' --output table
-```
-
-**Look for:** alarms covering RDS (CPU/connections/storage), Redis (memory/evictions), MSK (consumer lag/under-replicated partitions), ALB (5xx/target health/latency), CloudFront (5xx error rate); **no critical alarms stuck in `INSUFFICIENT_DATA`** (that's a monitoring blind spot); alarm actions wired to a real SNS topic; log groups with a defined retention (not "never expire" by accident, not too short).
-
----
-
-## 13. DNS (Route 53)
-
-```bash
+# What the record is actually set to
 aws route53 list-hosted-zones --query 'HostedZones[*].{Name:Name,Id:Id}'
 aws route53 list-resource-record-sets --hosted-zone-id <zone-id> \
-  --query 'ResourceRecordSets[?Type==`A` || Type==`CNAME`].{Name:Name,Type:Type,Target:AliasTarget.DNSName}'
+  --query "ResourceRecordSets[?Name=='${URL}.'].{Name:Name,Type:Type,TTL:TTL,Alias:AliasTarget.DNSName,Records:ResourceRecords}"
+
+# Does it resolve, and to what?
+dig +short $URL
+nslookup $URL
+
+# Propagation check — query public resolvers, not just your local cache
+dig +short $URL @8.8.8.8
+dig +short $URL @1.1.1.1
 ```
 
-**Look for:** the portal's records resolve to the correct CloudFront distribution / ALB; alias records rather than hardcoded IPs; health checks attached if you use DNS failover.
+**Look for:** the record present with the **expected alias target** (CloudFront distribution domain or ALB DNS); it resolves **consistently across resolvers** (propagation complete); TTL is sane. If resolvers disagree, propagation is still in flight — wait out the old TTL before trusting downstream checks.
 
 ---
 
-# Portal UI Verification — Checklist
-
-Manual walkthrough of the portal in the browser. Record **pass / fail + evidence** (screenshot, DevTools capture, correlation ID) for each item.
-
-> ⚠️ **The control path actuates real appliances.** Do every control/diagnostic test against a **designated TEST device only** — never a live customer appliance. Confirm which environment and which device you're pointed at before you click anything that sends a command.
-
-Tools you'll use throughout: browser **DevTools** → Network, Console, Application (cookies/storage) tabs. A couple of quick shell checks are included where faster.
-
----
-
-## 1. Load & delivery
-
-- Portal loads at the correct **prod URL** over **HTTPS** (valid cert, no browser warning).
-- No **mixed-content** warnings; no errors in the **Console** tab on load.
-- Static assets (JS/CSS/images) load from CloudFront/S3, not a dev origin — check the **Network** tab domains.
-- Correct **build/version** is live (check a version string, `/version` endpoint, or build hash in asset filenames) — confirm it matches the intended release.
-- Page title, favicon, and branding are the production ones (not staging).
+## 2. TLS on the new hostname
 
 ```bash
-# Security & cache headers in one shot
-curl -sI https://<portal-url> | grep -iE \
- 'strict-transport-security|content-security-policy|x-frame-options|x-content-type-options|referrer-policy|cache-control|server'
+# Cert served on the new URL: subject/SAN match, issuer, expiry
+echo | openssl s_client -servername $URL -connect $URL:443 2>/dev/null \
+  | openssl x509 -noout -subject -issuer -dates -ext subjectAltName
 ```
 
----
-
-## 2. Authentication (OAuth)
-
-- Hitting the portal while logged out **redirects to the OAuth login**.
-- Valid credentials log in and land on the expected home/dashboard.
-- **Refreshing the page keeps you logged in** (session persists).
-- **Token refresh** works — stay past the access-token lifetime and confirm the session continues without a hard re-login (watch the Network tab for a refresh call).
-- **Expired/invalid token** is handled gracefully (clean redirect to login, not a white screen or a raw error).
-- **Logout** clears the session; hitting a back button or deep link afterward doesn't restore access.
-- **Deep-link protection:** pasting an authenticated URL while logged out redirects to login rather than exposing the page.
-- **Authorization / RBAC:** an agent sees and can act on **only the devices/actions their role permits**. Try (in a test account) to reach a device outside scope and confirm it's blocked — this is the most security-critical UI check for a device-control portal.
+**Look for:** the SAN list **includes the new hostname**; `notAfter` comfortably in the future; trusted issuer; handshake succeeds with no warning. A mismatched SAN is the classic post-rename failure.
 
 ---
 
-## 3. Navigation & core pages
+## 3. Edge reachability — CloudFront + ALB
 
-- All primary nav links resolve — no dead ends or 404s.
-- **Device list** loads; search, filter, sort, and pagination behave on a realistic data volume.
-- **Device detail** page opens and shows current state.
-- Deep-linking to a specific device by URL works and respects auth/RBAC.
-- Browser **back/forward** behaves; refreshing a deep page doesn't break routing (SPA route handling).
+```bash
+# CloudFront: deployed, enabled, and carrying the new alias
+aws cloudfront list-distributions \
+  --query "DistributionList.Items[?contains(Aliases.Items, '${URL}')].{Id:Id,Status:Status,Enabled:Enabled,Domain:DomainName}"
 
----
+# ALB targets healthy behind the scenes
+aws elbv2 describe-target-health --target-group-arn <tg-arn> \
+  --query 'TargetHealthDescriptions[*].{Target:Target.Id,State:TargetHealth.State,Reason:TargetHealth.Reason}'
 
-## 4. Real-time updates (Stream API / SSE)
+# Does the app actually serve at the new URL? (follow redirects, show timing)
+curl -sSL -o /dev/null -w 'HTTP %{http_code}  time %{time_total}s  redirects %{num_redirects}\n' https://$URL
 
-- On a device detail page, **state updates appear live** without a manual refresh.
-- **Latency** between an actual state change (on a test device) and the UI reflecting it is acceptable.
-- The stream **survives an idle period** — leave the page open several minutes and confirm updates still arrive (this catches ALB/CloudFront idle-timeout and edge-buffering issues that only appear in prod).
-- **Reconnection:** toggle your network off/on (DevTools → Network → Offline) and confirm the stream reconnects and resumes without a full reload.
-- Open the device in **two tabs** and confirm both receive updates consistently.
-- Check the **Network** tab: the SSE/EventStream connection is open and receiving events (not repeatedly failing and retrying).
+# HTTP must redirect to HTTPS
+curl -sSI http://$URL | grep -iE 'HTTP/|location'
+```
 
----
-
-## 5. Diagnostics
-
-- Run a diagnostic against a **test device**; results render correctly.
-- **Loading state** shows while it runs; **error state** shows cleanly if it fails or times out.
-- Results reflect real device data (cross-check against a known value).
+**Look for:** distribution `Deployed` + `Enabled` with the new alias; **all ALB targets `healthy`**; `HTTP 200` from the new URL; HTTP→HTTPS redirect working.
 
 ---
 
-## 6. Control path — highest caution ⚠️
+## 4. Confirm the RIGHT build is live (not a cached old one)
 
-Use a **designated test appliance**. Never issue control commands to a real customer device during verification.
+```bash
+# Version endpoint or build hash, whichever the app exposes
+curl -sS https://$URL/version 2>/dev/null || true
+curl -sS https://$URL | grep -oE 'build[-_/][a-z0-9]+' | head
 
-- A control command from the UI **reaches the test device** and the device responds.
-- The resulting **state change flows back** and the UI updates (ties into §4).
-- **Confirmation UX:** destructive/impactful actions require a confirm step; there's clear feedback on success/failure.
-- **Offline device:** controls are disabled or clearly error when the device is offline, rather than silently appearing to succeed.
-- **Partial/failed delivery:** simulate a command that doesn't complete and confirm the UI communicates the true state (no false "success").
-- **Guardrails:** rate limiting / bulk-action confirmation exist so an accidental click can't actuate many devices at once.
-- **Permission enforcement:** an agent cannot send a control command to a device outside their authorized scope.
-- **Audit trail:** every control action is recorded with **who** (agent identity), **what** (command), **when** (timestamp), and **which device** — verify the entry actually appears after your test action.
+# Security/cache headers on the new URL
+curl -sSI https://$URL | grep -iE \
+ 'strict-transport-security|content-security-policy|x-frame-options|x-content-type-options|cache-control|x-cache'
+```
 
----
-
-## 7. Legacy frontend
-
-- The legacy UI **loads and functions** against the legacy API.
-- **Auth** works for legacy (either its own login or SSO bridged from the new OAuth) — no separate broken login.
-- Whatever functionality legacy still owns has **parity / correctness** for those flows.
-- Navigation **between new and legacy** (if linked) works with no broken hand-offs or auth loss.
+**Look for:** version/build string matches **the release you just deployed** — a stale build here means CloudFront is serving a cached old version (invalidate if so). `x-cache` reveals hit/miss from the edge.
 
 ---
 
-## 8. Error handling & resilience (user-facing)
+## 5. Kubernetes workload health (read-only)
 
-- Simulate an **API failure** (e.g. block the API host in DevTools) and confirm the UI shows a graceful error, not a blank screen.
-- **401 / 403 / 404 / 500** conditions each produce a sensible page or message.
-- **Form validation:** invalid input is caught client-side with clear messages; server-side validation errors surface readably.
-- **Timeouts** are handled (spinner doesn't hang forever; a retry or error appears).
+```bash
+kubectl get pods -n $NS -o wide
+kubectl get pods -n $NS --sort-by='.status.containerStatuses[0].restartCount'
+kubectl get deploy -n $NS -o custom-columns=\
+NAME:.metadata.name,DESIRED:.spec.replicas,READY:.status.readyReplicas,AVAIL:.status.availableReplicas
 
----
+# Images running = intended release
+kubectl get pods -n $NS -o jsonpath='{.items[*].spec.containers[*].image}' | tr ' ' '\n' | sort -u
 
-## 9. Client-side security
+# ArgoCD synced & healthy to the release
+kubectl get applications -n argocd -o custom-columns=\
+NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status
+```
 
-- **Response headers** present (from §1 curl or the Network tab): `Strict-Transport-Security`, `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, a frame-protection header (`X-Frame-Options` / CSP `frame-ancestors`), `Referrer-Policy`.
-- **Cookies** (Application → Cookies): session cookies are `HttpOnly`, `Secure`, and have a sensible `SameSite`.
-- **No secrets in the client:** search the JS bundle and Console for tokens, API keys, or credentials; none should be hardcoded.
-- **No sensitive data in URLs** (tokens/PII shouldn't ride in query strings that land in logs/history).
-- **Token storage:** confirm where the access token lives and that it's appropriate for your threat model (e.g. not a long-lived token sitting in `localStorage` if that's a concern for your team).
-- **CORS** behaves — the app's own calls succeed; cross-origin calls that should be blocked are blocked.
-
----
-
-## 10. Cross-browser & responsive
-
-- Works in the browsers agents actually use (**Chrome, Firefox, Safari, Edge**).
-- If agents use tablets/phones, verify **responsive layouts** and touch interactions.
-- Reasonable behavior at different **zoom levels** and screen resolutions.
+**Look for:** no CrashLoop/ImagePull, low restart counts, `DESIRED == READY == AVAIL`, images match the release tag/digest, all Argo apps **Synced + Healthy**.
 
 ---
 
-## 11. Performance (user-perceived)
+## 6. Per-service health (read-only, in-cluster)
 
-- Initial load time is acceptable on a representative connection; run a **Lighthouse** pass for a baseline.
-- **Long-session stability:** leave a device page with a live SSE stream open for a while and watch **memory** in DevTools — a steadily climbing heap suggests a leak in the stream handling.
-- Large device lists render and scroll without freezing.
+```bash
+# Actuator health for each API pod (adjust selector/port/path)
+for p in $(kubectl get pods -n $NS -l <selector> -o name); do
+  echo "== $p =="; kubectl exec $p -n $NS -- curl -s localhost:8080/actuator/health | jq -c .
+done
+```
 
----
-
-## 12. Accessibility (if in scope)
-
-- **Keyboard navigation** reaches all interactive elements with visible focus states.
-- Form fields have **labels**; images have alt text.
-- **Color contrast** meets AA for text and key UI.
-- Landmarks/roles present for screen-reader users.
+Confirm: **OAuth API** healthy and its signing keys reachable; **main data/control API** shows its `db` component `UP`; **Stream API** healthy.
 
 ---
 
-## 13. Observability from the user side
+## 7. Real-time (SSE) through the new URL
 
-- **Trigger a deliberate error** in the UI and confirm it appears in your logging/monitoring with a **correlation ID** you can trace back through the APIs.
-- If a frontend error tracker (Sentry / RUM) is expected, confirm events actually arrive.
+```bash
+# End-to-end stream via the new hostname — confirm events flow AND the connection stays open
+curl -N --max-time 30 https://$URL/<sse-path>
+```
+
+**Look for:** events arrive and the connection **stays open** through the edge (idle-timeout / buffering not killing it). Ctrl-C once you've seen events flow. This is the check most likely to behave differently in prod than lower envs.
 
 ---
 
-## Roll it up
+## 8. Data layer (read-only)
 
-Summarize as pass/fail with evidence, and flag any **auth/RBAC gap, control-path safety gap, or false-success behavior** prominently in the go/no-go — those are the failures that matter most on a portal that controls physical devices.
+```bash
+aws rds describe-db-instances --db-instance-identifier <id> \
+  --query 'DBInstances[0].{Status:DBInstanceStatus,MultiAZ:MultiAZ}'
+aws elasticache describe-replication-groups --replication-group-id <id> \
+  --query 'ReplicationGroups[0].{Status:Status,AutoFailover:AutomaticFailover}'
+
+# Kafka consumer lag near zero (from a pod/bastion with the CLI tools)
+kafka-consumer-groups.sh --bootstrap-server <bootstrap> --describe --group <group>   # LAG column
+```
+
+**Look for:** RDS + Redis `available`; **consumer lag near zero and not climbing** on the account/queue handlers.
+
+---
+
+## 9. Post-cutover error signal
+
+```bash
+# Anything firing right after the switch?
+aws cloudwatch describe-alarms --state-value ALARM --query 'MetricAlarms[*].AlarmName'
+
+# ALB 5xx since the cutover
+aws cloudwatch get-metric-statistics --namespace AWS/ApplicationELB \
+  --metric-name HTTPCode_Target_5XX_Count \
+  --dimensions Name=LoadBalancer,Value=<lb-id> \
+  --start-time $START --end-time $END --period 60 --statistics Sum
+
+# Fresh app-log errors post-deploy
+kubectl logs -n $NS -l <selector> --since=15m | grep -iE 'error|exception|fatal' | tail -30
+```
+
+**Look for:** no new alarms in `ALARM`; **no 5xx spike** correlated with the cutover time; no flood of new exceptions in the logs.
+
+---
+
+## 10. User-journey smoke test — browser, READ-ONLY
+
+Walk the path against the **new URL**, confirming each hop, **without sending any control command to a live device**:
+
+1. Load `https://$URL` → correct app, HTTPS, no console errors.
+2. **OAuth login** redirect works → land on dashboard.
+3. **Device list** loads (RBAC: only permitted devices visible).
+4. Open a **device detail** → current state shows.
+5. **Live state update** arrives via SSE without a manual refresh.
+
+> **Do not issue control commands to real customer appliances as part of prod verification.** If the control path must be validated, use a **designated test device** per the UI checklist — never a live customer device.
+
+---
+
+## Rollback trigger
+
+If DNS points wrong, the wrong build is served and won't invalidate, targets are unhealthy, a 5xx spike tracks the cutover, or the control/auth path misbehaves — **revert the Route53 record to the previous target** (or roll back via ArgoCD) per your runbook rather than debugging live. Capture pass/fail + evidence for each section as your go/no-go record.
