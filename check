@@ -1,0 +1,336 @@
+
+Three principles before the checklist:
+
+- **Understand before you verify.** You can't confirm something works if you don't know what "working" looks like.
+- **Confirm which environment you're touching, and start read-only.** This portal *controls physical appliances* — an accidental control command in prod could literally actuate a customer's device. Never run mutating checks in prod until you know they're safe.
+- The control path deserves extra scrutiny (more below).
+
+**Step 0 — before you touch anything.** This is the highest-leverage move, and asking for it signals maturity, not weakness. Get the existing architecture diagrams, runbooks, and any prior environment verification plans, and find out what's already been verified vs. what's outstanding so you don't reinvent or duplicate. Secure read-only access to the AWS console, `kubectl`, the ArgoCD UI, the repos, and the observability dashboards. Then draw the architecture yourself — data flow *and* control flow. That becomes your map.
+
+Then work the layers:
+
+**1. Infrastructure**
+- EKS: nodes Ready, capacity headroom, autoscaling configured
+- Pods: no CrashLoopBackOff or excessive restarts; resource requests + limits set; liveness/readiness/startup probes defined
+- RDS MySQL: connectivity from pods, Multi-AZ, automated backups + retention, sane connection-pool sizing
+- Redis: connectivity, auth/TLS, persistence-vs-cache intent, eviction policy, memory headroom
+- Kafka: broker health, topic replication factor ≥3 with `min.insync.replicas`, partition counts, retention
+- ALB / CloudFront / S3: target health, routing rules, valid TLS certs, correct origins/cache behavior, S3 not unintentionally public
+
+**2. Deployment (ArgoCD + K8s)**
+- All Argo apps Synced *and* Healthy, no `OutOfSync` drift
+- Image tags pinned to a release (not `latest`); target revision points at the prod version
+- HPA, PodDisruptionBudgets, network policies present; secrets via a proper mechanism, not plaintext manifests
+
+**3. Backend services (each Spring Boot API)**
+- Actuator health endpoints green; prod profile active with no dev config/endpoints leaking; DB migrations (Flyway/Liquibase) applied
+- OAuth API: token issuance, validation, expiry, refresh, revocation, correct scopes/claims, JWKS/key rotation, clock-skew tolerance
+- Stream API (SSE): connection establishes, events arrive with low latency, reconnection/backpressure behave — and check that ALB/CloudFront idle timeouts don't kill long-lived SSE connections and responses aren't buffered. This is a classic failure that only shows up in prod.
+- Main data/control API: CRUD, input validation, authorization enforced, rate limiting, and control commands that are idempotent + audit-logged
+
+**4. Event processing (Kafka)**
+- Consumers attached to the right topics, consuming, lag near zero
+- Account/queue handlers processing correctly; retries + dead-letter handling; offset management with no loss or reprocessing
+
+**5. Frontend**
+- React app loads via CloudFront, correct build/version, points at prod APIs (not dev), no console errors, auth redirect works, CSP headers present
+- Legacy frontend still loads and functions against the legacy API
+
+**6. End-to-end — the real test.** Walk a full agent journey and confirm each hop: log in (OAuth) → view a device → see real-time state via SSE → run a diagnostic → send a control command → device responds → state update reflects it → audit log records who/what/when/which device. Do this for both the new and legacy user-facing paths.
+
+Three cross-cutting things worth calling out separately:
+
+*Security and the control path* — the biggest risk here. Authorization scoped so an agent can only see/control permitted devices; every control action audit-logged, rate-limited, with fail-safe behavior when a device is offline or a command half-delivers; TLS in transit everywhere, least-privilege IAM (IRSA for pods), no hardcoded secrets, dependency and container image scanning.
+
+*Observability* — if you can't see it, you can't claim it's healthy. Logs flowing and structured; dashboards for the golden signals (latency, traffic, errors, saturation); correlation IDs across services; and actually test that one alert fires to the right place. Add SSE connection-count and Kafka consumer-lag alerts specifically.
+
+*Resilience* — verify, don't assume. Kill a pod and confirm recovery; trigger RDS/Redis failover; drop a Kafka broker; check what happens when Kafka or Redis is fully down. Crucially, prove a backup restore actually works and that rollback via ArgoCD is clean.
+
+# EKS Verification — Command Reference
+
+Portal: remote diagnose/monitor/**control** of customer appliances.
+
+> ⚠️ **This portal can actuate physical devices.** Confirm your cluster/context and the environment **before every session**. Everything in sections 0–14 is **read-only**. Section 15 contains **mutating / resilience** commands — do not run those in prod without sign-off.
+
+**Convention:** replace placeholders `<cluster>`, `<region>`, `<namespace>`, `<pod>`, `<name>`, `<label>` with real values. Set `export NS=<namespace>` once and reuse.
+
+---
+
+## 0. Confirm identity & cluster (do this first, every time)
+
+```bash
+kubectl config current-context          # WHICH cluster am I on?
+kubectl config get-contexts             # all contexts; note the * marker
+aws sts get-caller-identity             # which AWS account/role
+aws eks describe-cluster --name <cluster> --region <region> \
+  --query 'cluster.{status:status,version:version,endpoint:endpoint,platform:platformVersion}'
+
+# (Re)point kubeconfig if needed — only edits local config, safe
+aws eks update-kubeconfig --name <cluster> --region <region>
+```
+
+If `current-context` isn't unmistakably the environment you intend, **stop** and fix it before running anything else.
+
+---
+
+## 1. Fast triage snapshot
+
+Run these first for a 30-second health read, then dig into whatever looks off.
+
+```bash
+kubectl get nodes -o wide
+kubectl get pods -A | grep -Ev '([0-9]+)/\1' | grep -vE 'Completed|Running'   # pods NOT fully ready
+kubectl get events -A --sort-by=.lastTimestamp | tail -40                     # recent cluster events
+kubectl top nodes                                                             # needs metrics-server
+```
+
+---
+
+## 2. Cluster & node health
+
+```bash
+kubectl version                                  # client/server skew
+kubectl get nodes -o wide
+kubectl get nodes -o custom-columns=\
+NAME:.metadata.name,STATUS:.status.conditions[-1].type,\
+KUBELET:.status.nodeInfo.kubeletVersion,INSTANCE:.metadata.labels.node\.kubernetes\.io/instance-type
+
+kubectl describe nodes | grep -E 'Name:|Taints:|MemoryPressure|DiskPressure|PIDPressure|Ready'
+kubectl top nodes                                # CPU/mem headroom per node
+```
+
+Look for: all nodes `Ready`, no `*Pressure` conditions, uniform kubelet versions, capacity to reschedule a lost node.
+
+---
+
+## 3. Namespaces & overall workload state
+
+```bash
+kubectl get ns
+export NS=<namespace>
+
+kubectl get all -n $NS
+kubectl get pods -n $NS -o wide
+
+# Problem pods
+kubectl get pods -n $NS --field-selector=status.phase!=Running
+# Flapping / crashlooping — sort by restart count
+kubectl get pods -n $NS --sort-by='.status.containerStatuses[0].restartCount'
+```
+
+Look for: zero `CrashLoopBackOff`/`ImagePullBackOff`/`Pending`, low restart counts, all containers `READY n/n`.
+
+---
+
+## 4. Deployments & rollouts
+
+```bash
+kubectl get deploy,sts,ds -n $NS
+
+# Desired vs available replicas at a glance
+kubectl get deploy -n $NS -o custom-columns=\
+NAME:.metadata.name,DESIRED:.spec.replicas,READY:.status.readyReplicas,AVAIL:.status.availableReplicas,UPTODATE:.status.updatedReplicas
+
+kubectl rollout status deploy/<name> -n $NS
+kubectl rollout history deploy/<name> -n $NS
+
+# Full spec: probes, resources, limits, strategy
+kubectl describe deploy/<name> -n $NS
+```
+
+Look for: `DESIRED == READY == AVAIL`, RollingUpdate strategy sane, liveness/readiness/startup probes defined, resource **requests _and_ limits** set.
+
+---
+
+## 5. Image tags — confirm a pinned release, not `latest`
+
+```bash
+kubectl get pods -n $NS -o jsonpath=\
+'{range .items[*]}{.metadata.name}{"\t"}{.spec.containers[*].image}{"\n"}{end}'
+
+# Just the unique images running in the namespace
+kubectl get pods -n $NS -o jsonpath='{.items[*].spec.containers[*].image}' \
+  | tr ' ' '\n' | sort -u
+```
+
+Every image should carry an explicit version/digest matching your intended prod release. `:latest` or unexpected tags are a red flag.
+
+---
+
+## 6. Per-service deep dive (repeat for each API + frontend)
+
+```bash
+kubectl describe pod <pod> -n $NS               # events, probe results, mounts, why-not-scheduled
+kubectl logs <pod> -n $NS --tail=100
+kubectl logs <pod> -n $NS --previous            # logs from the last crash, if any
+kubectl logs -l app=<label> -n $NS --tail=50    # aggregate across replicas
+kubectl top pods -n $NS
+
+# Spring Boot health from inside the pod (read-only)
+kubectl exec <pod> -n $NS -- curl -s localhost:8080/actuator/health | jq .
+kubectl exec <pod> -n $NS -- curl -s localhost:8080/actuator/info   | jq .
+```
+
+For the **OAuth API**, confirm health + that it can reach its signing keys. For the **main data/control API**, confirm DB connectivity in the health output (`db` component `UP`). Only run **read** commands inside app pods.
+
+---
+
+## 7. Config & secrets (verify wiring, not values)
+
+```bash
+kubectl get configmap -n $NS
+kubectl get secret -n $NS                        # names/types only — do NOT dump values
+
+# What config/env does a deployment consume?
+kubectl get deploy/<name> -n $NS -o jsonpath='{.spec.template.spec.containers[*].envFrom}' | jq .
+kubectl get deploy/<name> -n $NS -o jsonpath='{.spec.template.spec.containers[*].env}'     | jq .
+
+# If using External Secrets / Sealed Secrets, confirm they're synced
+kubectl get externalsecrets -A 2>/dev/null
+kubectl get sealedsecrets -A 2>/dev/null
+```
+
+Confirm secrets are sourced from a real backend (External Secrets, Sealed Secrets, SSM/Secrets Manager) — not committed plaintext. **Never** `kubectl get secret -o yaml` a prod secret into a shared log.
+
+---
+
+## 8. Networking — services, ingress, endpoints
+
+```bash
+kubectl get svc -n $NS -o wide
+kubectl get ingress -n $NS
+kubectl describe ingress <name> -n $NS           # ALB rules, listener/target config
+
+# Are services actually backed by READY pods? Empty endpoints = broken service
+kubectl get endpoints -n $NS
+kubectl get endpointslices -n $NS
+
+kubectl get networkpolicy -n $NS                 # confirm expected isolation exists
+```
+
+Empty `ENDPOINTS` on a service that should have backends is a classic silent failure — the pod is up but not passing readiness.
+
+---
+
+## 9. In-cluster connectivity test (ephemeral pod, auto-deletes)
+
+```bash
+kubectl run nettest --rm -it --image=nicolaka/netshoot -n $NS -- bash
+# then inside the throwaway pod:
+#   curl -s http://<svc>.<ns>.svc.cluster.local:<port>/actuator/health
+#   nslookup <svc>.<ns>.svc.cluster.local
+#   nc -vz <svc> <port>
+```
+
+The `--rm` flag deletes the pod on exit. Use this to prove service-to-service DNS and reachability without touching app pods.
+
+### SSE / Stream API check
+From the netshoot pod, hit the stream endpoint and confirm events flow **and the connection stays open**:
+```bash
+#   curl -N http://<stream-svc>.<ns>.svc.cluster.local:<port>/<sse-path>
+```
+`-N` disables buffering. If events arrive in-cluster but not through CloudFront/ALB, suspect idle-timeout or response buffering at the edge — verify those separately.
+
+---
+
+## 10. Autoscaling & disruption budgets
+
+```bash
+kubectl get hpa -n $NS
+kubectl describe hpa <name> -n $NS               # current vs target metrics, whether it can scale
+kubectl get pdb -n $NS                           # PodDisruptionBudgets protect availability
+
+# Node autoscaler present & healthy?
+kubectl get pods -n kube-system | grep -E 'cluster-autoscaler|karpenter'
+```
+
+Look for: HPAs reporting real metrics (not `<unknown>`), PDBs present for critical services so drains don't take everything down.
+
+---
+
+## 11. Load balancer controller & target group wiring
+
+```bash
+kubectl get pods -n kube-system | grep aws-load-balancer
+kubectl get targetgroupbindings -A              # links K8s svc → AWS target group
+kubectl describe ingress <name> -n $NS | grep -iA2 address    # the ALB DNS name
+```
+
+Cross-check the ALB target group in the AWS console shows **healthy** targets matching your ready pods.
+
+---
+
+## 12. IRSA / pod IAM (least privilege)
+
+```bash
+kubectl get sa -n $NS
+kubectl describe sa <serviceaccount> -n $NS      # look for eks.amazonaws.com/role-arn annotation
+
+# Which SA does each pod run as?
+kubectl get pods -n $NS -o custom-columns=\
+POD:.metadata.name,SA:.spec.serviceAccountName
+```
+
+Pods needing AWS access (S3, RDS via IAM auth, etc.) should use IRSA-annotated service accounts — not node instance roles or static keys.
+
+---
+
+## 13. Storage & certificates (if applicable)
+
+```bash
+kubectl get pvc -n $NS
+kubectl get pv
+kubectl get storageclass
+
+# If cert-manager manages TLS
+kubectl get certificate -A
+kubectl get certificaterequest -A
+kubectl describe certificate <name> -n $NS       # confirm Ready=True, not expiring soon
+```
+
+---
+
+## 14. ArgoCD — sync & drift (read-only)
+
+```bash
+argocd app list
+argocd app get <app>
+argocd app diff <app>                            # shows live-vs-desired drift; does NOT change anything
+
+# Or via kubectl if you can't use the CLI
+kubectl get applications -n argocd -o custom-columns=\
+NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status
+```
+
+Every app should be **Synced** and **Healthy** with no drift. `OutOfSync` means live state diverges from Git — investigate before go-live.
+
+---
+
+## 15. ⚠️ Mutating / resilience tests — NOT read-only
+
+Do **not** run these in production without explicit sign-off and a maintenance window. They change cluster state. Verify recovery behavior in a lower environment first, then repeat in prod only if your runbook calls for it.
+
+```bash
+# Kill a pod, confirm it reschedules and traffic recovers
+kubectl delete pod <pod> -n $NS
+
+# Restart a deployment (rolling)
+kubectl rollout restart deploy/<name> -n $NS
+
+# Roll back a deployment to the previous revision
+kubectl rollout undo deploy/<name> -n $NS
+
+# Cordon/drain a node (resilience test) — reschedules everything off it
+kubectl cordon <node>
+kubectl drain <node> --ignore-daemonsets --delete-emptydir-data
+kubectl uncordon <node>                          # restore when done
+```
+
+**Never** issue device-control commands as part of resilience testing — use synthetic/test devices or a non-prod environment for anything that reaches the appliance control path.
+
+---
+
+## Turning this into a deliverable
+
+For each section, record **pass/fail + evidence** (command output, ALB target-group screenshot, ArgoCD dashboard link). Close with a go/no-go summary and a pointer to the rollback runbook. That artifact is what demonstrates the verification actually happened.
+
