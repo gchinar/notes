@@ -1,195 +1,63 @@
-# Post-Deployment PROD Verification — Runbook
+That key spelling is worth a hard look before anything else: you wrote `COLLABO_TOKEN::COLABO_TOKEN` — the first half is `COLLABO` (double L) and the second is `COLABO` (single L). If the code that *writes* the token and the code that *reads* it don't spell it identically, Redis will hold the token fine but the reader will never find it — which looks exactly like "Redis isn't getting it." Confirm the exact spelling on both the write and read side first.
 
-Run **after** the prod deploy + Route53 URL change. Ordered as a live smoke test: verify the thing that just changed (DNS/URL) first, then work edge → app → data → user journey.
+Now the exact commands for that key (run inside your authenticated `redis-cli` session, read-only):
 
-> ⚠️ **This is production and the portal actuates real appliances. Everything here is READ-ONLY.** Do **not** send control commands, do **not** run resilience/failover tests, do **not** write data as part of this verification. Deeper per-domain checks live in the EKS / AWS-services / UI references — this runbook cross-references them.
+**1. Is the key there, and healthy?**
 
-Set your variables once:
-```bash
-export URL=<new-portal-hostname>        # e.g. portal.example.com (the newly changed Route53 record)
-export NS=<prod-namespace>
-export START=$(date -u -d '20 min ago' +%Y-%m-%dT%H:%M:%SZ)   # macOS: date -u -v-20M ...
-export END=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+```
+EXISTS COLLABO_TOKEN::COLABO_TOKEN     # 1 = present, 0 = missing
+TYPE   COLLABO_TOKEN::COLABO_TOKEN     # likely string
+TTL    COLLABO_TOKEN::COLABO_TOKEN     # secs left; -1 = no expiry set, -2 = key absent
+STRLEN COLLABO_TOKEN::COLABO_TOKEN     # >0 confirms it's populated, without printing the token
 ```
 
----
+`-2` on TTL = never written (or already evicted/expired). `-1` = written but no expiry — suspicious if this token is supposed to refresh.
 
-## 0. Confirm you're in PROD (do this first)
+**2. Catch any suffixed variants (per-user/per-session keys)**
 
-```bash
-aws sts get-caller-identity            # correct prod account?
-kubectl config current-context         # correct prod cluster?
+In case the real keys have more appended (e.g. a user ID):
+
+```
+redis-cli -h <endpoint> -p 6379 --tls --scan --pattern 'COLLABO_TOKEN::COLABO_TOKEN*'
+redis-cli -h <endpoint> -p 6379 --tls --scan --pattern 'COLLABO_TOKEN*'    # both spellings, wider net
 ```
 
-If either isn't unmistakably production, stop and fix your context before continuing.
+Run the wider `COLLABO_TOKEN*` one specifically to see whether **both** spellings exist as keys — if you see the single-L and double-L versions both present, that's your bug confirmed.
 
----
+**3. Only if you must inspect the value** (it's a live credential — don't paste it anywhere shared)
 
-## 1. DNS / Route 53 — the change you just made
-
-```bash
-# What the record is actually set to
-aws route53 list-hosted-zones --query 'HostedZones[*].{Name:Name,Id:Id}'
-aws route53 list-resource-record-sets --hosted-zone-id <zone-id> \
-  --query "ResourceRecordSets[?Name=='${URL}.'].{Name:Name,Type:Type,TTL:TTL,Alias:AliasTarget.DNSName,Records:ResourceRecords}"
-
-# Does it resolve, and to what?
-dig +short $URL
-nslookup $URL
-
-# Propagation check — query public resolvers, not just your local cache
-dig +short $URL @8.8.8.8
-dig +short $URL @1.1.1.1
+```
+GET COLLABO_TOKEN::COLABO_TOKEN
 ```
 
-**Look for:** the record present with the **expected alias target** (CloudFront distribution domain or ALB DNS); it resolves **consistently across resolvers** (propagation complete); TTL is sane. If resolvers disagree, propagation is still in flight — wait out the old TTL before trusting downstream checks.
+Prefer comparing lengths or a hash over eyeballing the raw token unless you're specifically validating it against what the upstream issued.
 
----
+**4. Confirm it's actually being written / refreshed**
 
-## 2. TLS on the new hostname
+Snapshot the TTL, wait through a refresh cycle (or trigger the flow on a test account), snapshot again:
 
-```bash
-# Cert served on the new URL: subject/SAN match, issuer, expiry
-echo | openssl s_client -servername $URL -connect $URL:443 2>/dev/null \
-  | openssl x509 -noout -subject -issuer -dates -ext subjectAltName
+```
+TTL COLLABO_TOKEN::COLABO_TOKEN        # note the number
+# ... wait / trigger token issuance ...
+TTL COLLABO_TOKEN::COLABO_TOKEN        # should reset upward if it's being refreshed
 ```
 
-**Look for:** the SAN list **includes the new hostname**; `notAfter` comfortably in the future; trusted issuer; handshake succeeds with no warning. A mismatched SAN is the classic post-rename failure.
+If the key is missing before the flow and present after, Redis is receiving it. If it stays missing, the write isn't reaching Redis — go to the app side.
 
----
+**5. Rule out eviction (silent token loss)**
 
-## 3. Edge reachability — CloudFront + ALB
-
-```bash
-# CloudFront: deployed, enabled, and carrying the new alias
-aws cloudfront list-distributions \
-  --query "DistributionList.Items[?contains(Aliases.Items, '${URL}')].{Id:Id,Status:Status,Enabled:Enabled,Domain:DomainName}"
-
-# ALB targets healthy behind the scenes
-aws elbv2 describe-target-health --target-group-arn <tg-arn> \
-  --query 'TargetHealthDescriptions[*].{Target:Target.Id,State:TargetHealth.State,Reason:TargetHealth.Reason}'
-
-# Does the app actually serve at the new URL? (follow redirects, show timing)
-curl -sSL -o /dev/null -w 'HTTP %{http_code}  time %{time_total}s  redirects %{num_redirects}\n' https://$URL
-
-# HTTP must redirect to HTTPS
-curl -sSI http://$URL | grep -iE 'HTTP/|location'
+```
+INFO stats | grep -E 'evicted_keys|expired_keys|keyspace_misses'
 ```
 
-**Look for:** distribution `Deployed` + `Enabled` with the new alias; **all ALB targets `healthy`**; `HTTP 200` from the new URL; HTTP→HTTPS redirect working.
+Rising `evicted_keys` = memory pressure is dropping the token before its TTL. `keyspace_misses` climbing = the app keeps looking for a token that isn't there.
 
----
+**6. App side — is the writer erroring?**
 
-## 4. Confirm the RIGHT build is live (not a cached old one)
-
-```bash
-# Version endpoint or build hash, whichever the app exposes
-curl -sS https://$URL/version 2>/dev/null || true
-curl -sS https://$URL | grep -oE 'build[-_/][a-z0-9]+' | head
-
-# Security/cache headers on the new URL
-curl -sSI https://$URL | grep -iE \
- 'strict-transport-security|content-security-policy|x-frame-options|x-content-type-options|cache-control|x-cache'
+```
+kubectl logs <oauth-pod> -n $NS --since=15m | grep -iE 'COLLABO_TOKEN|COLABO_TOKEN|redis|serializ|timeout' | tail -40
 ```
 
-**Look for:** version/build string matches **the release you just deployed** — a stale build here means CloudFront is serving a cached old version (invalidate if so). `x-cache` reveals hit/miss from the edge.
+Watch for serialization errors, Redis timeouts, or the app logging one spelling while you're checking the other.
 
----
-
-## 5. Kubernetes workload health (read-only)
-
-```bash
-kubectl get pods -n $NS -o wide
-kubectl get pods -n $NS --sort-by='.status.containerStatuses[0].restartCount'
-kubectl get deploy -n $NS -o custom-columns=\
-NAME:.metadata.name,DESIRED:.spec.replicas,READY:.status.readyReplicas,AVAIL:.status.availableReplicas
-
-# Images running = intended release
-kubectl get pods -n $NS -o jsonpath='{.items[*].spec.containers[*].image}' | tr ' ' '\n' | sort -u
-
-# ArgoCD synced & healthy to the release
-kubectl get applications -n argocd -o custom-columns=\
-NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status
-```
-
-**Look for:** no CrashLoop/ImagePull, low restart counts, `DESIRED == READY == AVAIL`, images match the release tag/digest, all Argo apps **Synced + Healthy**.
-
----
-
-## 6. Per-service health (read-only, in-cluster)
-
-```bash
-# Actuator health for each API pod (adjust selector/port/path)
-for p in $(kubectl get pods -n $NS -l <selector> -o name); do
-  echo "== $p =="; kubectl exec $p -n $NS -- curl -s localhost:8080/actuator/health | jq -c .
-done
-```
-
-Confirm: **OAuth API** healthy and its signing keys reachable; **main data/control API** shows its `db` component `UP`; **Stream API** healthy.
-
----
-
-## 7. Real-time (SSE) through the new URL
-
-```bash
-# End-to-end stream via the new hostname — confirm events flow AND the connection stays open
-curl -N --max-time 30 https://$URL/<sse-path>
-```
-
-**Look for:** events arrive and the connection **stays open** through the edge (idle-timeout / buffering not killing it). Ctrl-C once you've seen events flow. This is the check most likely to behave differently in prod than lower envs.
-
----
-
-## 8. Data layer (read-only)
-
-```bash
-aws rds describe-db-instances --db-instance-identifier <id> \
-  --query 'DBInstances[0].{Status:DBInstanceStatus,MultiAZ:MultiAZ}'
-aws elasticache describe-replication-groups --replication-group-id <id> \
-  --query 'ReplicationGroups[0].{Status:Status,AutoFailover:AutomaticFailover}'
-
-# Kafka consumer lag near zero (from a pod/bastion with the CLI tools)
-kafka-consumer-groups.sh --bootstrap-server <bootstrap> --describe --group <group>   # LAG column
-```
-
-**Look for:** RDS + Redis `available`; **consumer lag near zero and not climbing** on the account/queue handlers.
-
----
-
-## 9. Post-cutover error signal
-
-```bash
-# Anything firing right after the switch?
-aws cloudwatch describe-alarms --state-value ALARM --query 'MetricAlarms[*].AlarmName'
-
-# ALB 5xx since the cutover
-aws cloudwatch get-metric-statistics --namespace AWS/ApplicationELB \
-  --metric-name HTTPCode_Target_5XX_Count \
-  --dimensions Name=LoadBalancer,Value=<lb-id> \
-  --start-time $START --end-time $END --period 60 --statistics Sum
-
-# Fresh app-log errors post-deploy
-kubectl logs -n $NS -l <selector> --since=15m | grep -iE 'error|exception|fatal' | tail -30
-```
-
-**Look for:** no new alarms in `ALARM`; **no 5xx spike** correlated with the cutover time; no flood of new exceptions in the logs.
-
----
-
-## 10. User-journey smoke test — browser, READ-ONLY
-
-Walk the path against the **new URL**, confirming each hop, **without sending any control command to a live device**:
-
-1. Load `https://$URL` → correct app, HTTPS, no console errors.
-2. **OAuth login** redirect works → land on dashboard.
-3. **Device list** loads (RBAC: only permitted devices visible).
-4. Open a **device detail** → current state shows.
-5. **Live state update** arrives via SSE without a manual refresh.
-
-> **Do not issue control commands to real customer appliances as part of prod verification.** If the control path must be validated, use a **designated test device** per the UI checklist — never a live customer device.
-
----
-
-## Rollback trigger
-
-If DNS points wrong, the wrong build is served and won't invalidate, targets are unhealthy, a 5xx spike tracks the cutover, or the control/auth path misbehaves — **revert the Route53 record to the previous target** (or roll back via ArgoCD) per your runbook rather than debugging live. Capture pass/fail + evidence for each section as your go/no-go record.
+My honest first suspicion, given what you typed, is the double-L/single-L mismatch — check that before digging deeper. Want me to give you a one-shot script that checks both spellings and reports which one Redis actually holds?
