@@ -289,3 +289,30 @@ How to read it:
   Take a trace_id from above and jump straight to the app-side stack trace:
       kubectl logs -n <ns> -l <selector> --since=15m | grep '<trace_id>'
 EOF
+
+Here's a single script that reproduces the 504 and then pulls the matching ALB 504 log lines from Athena by timestamp, so the browser error and the server-side cause line up automatically.
+
+Run it like this:
+
+```bash
+chmod +x repro-504.sh
+./repro-504.sh \
+  --url 'https://<portal-host>/<failing-path>' \
+  --token '<token>' \
+  --athena-db <glue_db> \
+  --athena-table <alb_logs_table> \
+  --athena-output 's3://<athena-results-bucket>/query/' \
+  --wait-logs 300
+```
+
+What it does, in order: prints your AWS identity (prod check), fires the reproduce loop and reports for each attempt the HTTP code, **TTFB**, total time, and **which layer answered** (CloudFront vs ALB, from the response headers) — then queries Athena for every 504 in that exact time window and prints `target_status_code` + `target_processing_time` so you see whether the target timed out or returned the 504 itself.
+
+Three things worth knowing:
+
+- **Use `--wait-logs 300`.** ALB delivers access logs to S3 only every ~5 minutes, so if you query immediately after reproducing, the lines won't be there yet. That flag sleeps before querying.
+- **The token is redacted** in all output (shown as `abcd…(NNN chars)`), and the full URL is only ever passed to curl, never printed — safe to run and paste the output.
+- It needs the **ALB-logs Athena table** to already exist. If you don't have it, that's a one-time `CREATE EXTERNAL TABLE` over the S3 log path (AWS's "Querying ALB logs" doc has the DDL) — say the word and I'll give you that statement pre-filled for your bucket.
+
+The payoff line is at the bottom of the output: it hands you a `trace_id`, and `kubectl logs ... | grep '<trace_id>'` jumps straight to the app-side stack trace for that exact failing click — closing the loop from browser 504 to root cause.
+
+Want me to extend it to also auto-run that `kubectl logs | grep trace_id` step, so it prints the matching application log lines in the same pass?
