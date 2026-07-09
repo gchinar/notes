@@ -1,90 +1,291 @@
-The three clues together actually point pretty hard at a root cause before you run anything:
+The 504 in your browser DevTools already confirms what we suspected: a proxy (CloudFront or ALB) is returning "gateway timeout" because the backend didn't respond in time. The commands below pull the *server-side* view of that same 504 — the browser only shows you the edge's verdict, not which layer timed out or why.
 
-- **Exactly 30 seconds** = you're hitting a *fixed timeout*, not gradual slowness. Something in the chain has a 30s ceiling and cuts the request.
-- **Token in the URL** = this is almost certainly the **SSE/Stream endpoint** (the browser's `EventSource` can't send auth headers, so tokens get passed as a query param) — or a per-device data endpoint authenticated the same way.
-- **15 devices** = the backend work scales with device count and is taking *longer* than 30s to produce a response.
+**1. See the exact 504 as the browser sees it — with response headers**
 
-This is very likely the SSE-idle-timeout / slow-first-byte issue flagged throughout the earlier docs. Two prime suspects for the 30s cutoff — check both first:
-
-**1. CloudFront origin response timeout (defaults to exactly 30s for custom origins — top suspect)**
+Response headers reveal which layer generated it. `x-cache`, `via`, and the `server` header are the tells:
 
 ```bash
-aws cloudfront get-distribution-config --id <dist-id> \
-  --query 'DistributionConfig.Origins.Items[*].{Origin:DomainName,ResponseTimeout:CustomOriginConfig.OriginReadTimeout,KeepAlive:CustomOriginConfig.OriginKeepaliveTimeout}'
+curl -sS -D - -o /dev/null 'https://<url>/<failing-path>?token=<...>' \
+  -w '\n--- code=%{http_code} ttfb=%{time_starttransfer}s total=%{time_total}s ---\n'
 ```
-If `ResponseTimeout` is 30 and the origin takes longer than that to send the first byte, CloudFront returns a 504 at exactly 30s.
 
-**2. ALB idle timeout**
+Look at the response headers:
+- `x-cache: Error from cloudfront` + `via: ...cloudfront...` → **CloudFront** generated the 504 (its origin-response timeout fired).
+- No CloudFront markers, `server: awselb/2.0` → the **ALB** generated it (idle/target timeout).
+
+**2. Get the full error body CloudFront/ALB returns (the "hidden" part)**
+
+DevTools sometimes shows an empty/opaque body on a 504. Fetch it raw:
+
+```bash
+curl -sS 'https://<url>/<failing-path>?token=<...>' | head -50
+```
+
+**3. Pull the actual failing requests from ALB access logs (this is where the real errors hide)**
+
+The browser can't show you `target_processing_time` or `target_status_code` — the ALB logs can, and they're decisive. If access logs go to S3, query with Athena:
+
+```sql
+SELECT time, elb_status_code, target_status_code, target_processing_time,
+       request_verb, request_url
+FROM   alb_logs
+WHERE  elb_status_code = '504'
+  AND  time >= '<recent-ISO-timestamp>'
+ORDER  BY time DESC
+LIMIT  20;
+```
+
+Reading the result:
+- `target_status_code = "-"` and `target_processing_time ≈ 30` (or ≈ your idle timeout) → **the target never responded in time; the ALB cut it.** Backend-slow, confirmed.
+- `elb_status_code=504` but `target_status_code=504` → the target *itself* returned 504 (something behind it, e.g. the legacy API or a downstream call).
+
+To find where the logs are:
 
 ```bash
 aws elbv2 describe-load-balancer-attributes --load-balancer-arn <lb-arn> \
-  --query "Attributes[?Key=='idle_timeout.timeout_seconds']"
+  --query "Attributes[?Key=='access_logs.s3.enabled' || Key=='access_logs.s3.bucket' || Key=='access_logs.s3.prefix']"
 ```
 
-**3. Reproduce and measure where it dies — TTFB is the key number**
-
-```bash
-# The exact failing request (token-in-url). See if it hangs ~30s then 504s.
-curl -sS -o /dev/null -w 'code=%{http_code} ttfb=%{time_starttransfer}s total=%{time_total}s\n' \
-  'https://<url>/<path>?token=<...>'
-
-# If it's the SSE stream — do events arrive, or does it stall then drop at 30s?
-curl -N -sS -w '\nHTTP %{http_code} total %{time_total}s\n' 'https://<url>/<sse-path>?token=<...>'
-```
-
-If `ttfb` climbs toward 30s and then errors, the **backend isn't producing a first byte in time** and a proxy is killing it. If events never flush but the backend is working, suspect **edge buffering** of the SSE stream.
-
-**4. Confirm which layer generated the timeout (ALB access logs are decisive)**
+**4. CloudFront's own view of the 504**
 
 ```bash
 export START=$(date -u -d '30 min ago' +%Y-%m-%dT%H:%M:%SZ); export END=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-# ELB-generated 5xx (504 = target too slow) vs target-generated 5xx
-aws cloudwatch get-metric-statistics --namespace AWS/ApplicationELB --metric-name HTTPCode_ELB_5XX_Count \
-  --dimensions Name=LoadBalancer,Value=<lb-id> --start-time $START --end-time $END --period 60 --statistics Sum
-aws cloudwatch get-metric-statistics --namespace AWS/ApplicationELB --metric-name TargetResponseTime \
-  --dimensions Name=LoadBalancer,Value=<lb-id> --start-time $START --end-time $END --period 60 --statistics Average Maximum
+aws cloudwatch get-metric-statistics --namespace AWS/CloudFront --metric-name 5xxErrorRate \
+  --dimensions Name=DistributionId,Value=<dist-id> Name=Region,Value=Global \
+  --start-time $START --end-time $END --period 60 --statistics Average --region us-east-1
 ```
 
-In the ALB access logs (S3/Athena), look at `target_processing_time` for the failing request: a value near 30 with `elb_status_code=504` and `target_status_code="-"` confirms the **target took too long and the ALB/CloudFront cut it** — not the app returning an error.
+(CloudFront metrics live in `us-east-1` regardless of your app region.)
 
-**5. Now find WHY the backend is slow for 15 devices**
+**5. The application-side error behind the 504 — the real root cause**
 
-The likely culprit is a serial fan-out or N+1: 15 devices × a slow per-device call (downstream/appliance/DB) exceeding 30s.
+The 504 is a symptom; the app log around that same timestamp holds the cause (the slow device fan-out, a downstream timeout, an exception):
 
 ```bash
-# App logs for the slow request — look for the device loop / repeated calls
-kubectl logs <api-pod> -n $NS --since=10m | grep -iE 'device|token|timeout|slow' | tail -60
+# Errors/exceptions in the window the browser saw the 504
+kubectl logs <api-pod> -n $NS --since=15m | grep -iE 'error|exception|timeout|504|device|token' | tail -60
 
-# Are threads blocked waiting on downstream/DB while it hangs? (thread dump, read-only)
+# Across all replicas (the failing request may have hit any pod)
+kubectl logs -n $NS -l <selector> --since=15m --prefix | grep -iE 'exception|timeout|slow' | tail -80
+
+# If the pod is still processing the hung request, catch what's blocked
 kubectl exec <api-pod> -n $NS -- curl -s localhost:8080/actuator/threaddump \
-  | jq -r '.threads[] | select(.threadState=="BLOCKED" or .threadState=="WAITING") | .threadName' | sort | uniq -c | sort -rn | head
-
-# Per-endpoint latency the app itself sees
-kubectl exec <api-pod> -n $NS -- curl -s 'localhost:8080/actuator/metrics/http.server.requests' | jq .
-kubectl top pods -n $NS        # is the pod CPU-saturated during the hang?
+  | jq -r '.threads[] | select(.threadState=="BLOCKED" or .threadState=="WAITING").threadName' \
+  | sort | uniq -c | sort -rn | head
 ```
 
-**6. Is a DB query stuck ~30s? (run WHILE reproducing — read-only)**
+**6. Correlate the browser request to the server log**
+
+To tie the *exact* click to a log line, grab the trace/request ID from DevTools and grep it server-side:
+
+- In DevTools → Network → click the failed request → **Headers** tab → look in Response Headers for `x-amz-cf-id` (CloudFront) or `x-request-id` / `x-amzn-trace-id` (ALB/app).
 
 ```bash
-mysql -h <rds-endpoint> -u <ro-user> -p \
-  -e "SELECT id,time,state,LEFT(info,120) FROM information_schema.processlist WHERE command<>'Sleep' AND time>3 ORDER BY time DESC;"
+kubectl logs -n $NS -l <selector> --since=15m | grep '<x-request-id-or-trace-id>'
 ```
-A query sitting at ~30s here is your smoking gun — likely one per device (N+1) or a missing index.
 
-**7. Token lookup latency (ties to the Redis work)**
+That's the cleanest link between "the browser showed a 504" and "here's the exact request and stack trace that caused it."
+
+**7. Confirm the timing story end-to-end**
 
 ```bash
-redis-cli -h <endpoint> -p 6379 --tls --latency        # baseline round-trip
-redis-cli -h <endpoint> -p 6379 --tls SLOWLOG GET 10    # slow ops (e.g. token validation × 15)
-```
-If the token is re-validated once *per device*, that's 15 Redis/JWKS lookups per click — check whether validation is cached or repeated.
-
-**One thing to rule in/out on the "token in URL" itself:** a very long token can blow past URL/header size limits, but that throws a fast 400/414/431 — not a 30s hang — so it's probably not the *timeout* cause here, just how this endpoint authenticates. Worth a quick check though:
-
-```bash
-curl -sS -o /dev/null -w '%{http_code} url_len=%{size_request}\n' 'https://<url>/<path>?token=<...>'
+# Does it consistently die at ~30s? Run a few times.
+for i in 1 2 3; do
+  curl -sS -o /dev/null -w 'try'$i': code=%{http_code} ttfb=%{time_starttransfer}s total=%{time_total}s\n' \
+    'https://<url>/<failing-path>?token=<...>'
+done
 ```
 
-My money's on **CloudFront's 30s origin response timeout firing because the 15-device fan-out (or its token re-validation) takes longer than 30s to first byte.** Start with steps 1–4 to confirm the layer, then 5–7 for the cause. Want a single script that runs the reproduce-and-measure (step 3) plus pulls the ALB 504/TargetResponseTime metrics in one go, so you get the layer and the timing in one shot?
+If every attempt errors at ~30s with `ttfb` near 30, the backend isn't producing a first byte inside the origin/idle timeout — which loops back to the 15-device fan-out being the thing to fix (raise the origin-response timeout as a stopgap, but the real fix is making that endpoint respond faster or stream incrementally).
+
+The short version of the trail: **DevTools 504 → ALB access log tells you *which layer* and *how long the target took* → app log at that timestamp tells you *why*.** Steps 1 and 3 will pin the layer in about two minutes.
+
+Want a single script that fires the reproduce loop and pulls the matching ALB-504 log lines by timestamp, so the browser error and the server-side cause line up automatically?
+
+#!/usr/bin/env bash
+#
+# repro-504.sh — reproduce a portal 504 and pull the matching ALB access-log
+# lines from Athena, correlated by timestamp, so the browser error lines up
+# with the server-side cause.
+#
+# READ-ONLY / PROD note: this sends GET requests to the failing URL (the
+# "reproduce" step) and runs Athena SELECT queries only. Do NOT point --url at a
+# control/mutating endpoint. The token is redacted from all output.
+#
+# Prereqs: ALB access logs enabled -> S3, and an Athena/Glue table over them.
+# (AWS docs: "Querying Application Load Balancer logs" — create the external table once.)
+#
+set -euo pipefail
+
+# ----------------------------- config ---------------------------------------
+# Edit here, or override via env vars, or pass --flags (see --help).
+URL="${URL:-}"                       # failing URL WITHOUT the token query, e.g.
+                                     #   https://portal.example.com/api/devices/stream
+TOKEN="${TOKEN:-}"                   # token value that goes in the query string
+TOKEN_PARAM="${TOKEN_PARAM:-token}"  # query-param name for the token
+ITERATIONS="${ITERATIONS:-3}"        # how many times to reproduce
+MAX_TIME="${MAX_TIME:-45}"           # curl timeout (> the 30s cutoff so we SEE the 504)
+REGION="${REGION:-us-east-1}"        # region of the Athena/ALB setup
+
+ATHENA_DB="${ATHENA_DB:-}"           # Glue DB holding the ALB access-log table
+ATHENA_TABLE="${ATHENA_TABLE:-}"     # ALB access-log table name
+ATHENA_OUTPUT="${ATHENA_OUTPUT:-}"   # s3://bucket/prefix/ for Athena results
+WINDOW_BUFFER_SEC="${WINDOW_BUFFER_SEC:-120}"  # widen log window each side
+LOG_WAIT_SEC="${LOG_WAIT_SEC:-0}"    # wait before querying (ALB delivers logs ~every 5 min)
+# ----------------------------------------------------------------------------
+
+usage() {
+  cat <<EOF
+Usage: $0 --url URL --token TOKEN --athena-db DB --athena-table TBL --athena-output s3://.../ [options]
+
+Required (flag or env var):
+  --url            Failing URL WITHOUT the token query string   (env URL)
+  --token          Token value for the query string             (env TOKEN)
+  --athena-db      Glue database with the ALB log table         (env ATHENA_DB)
+  --athena-table   ALB access-log table name                    (env ATHENA_TABLE)
+  --athena-output  s3://bucket/prefix/ for Athena query results (env ATHENA_OUTPUT)
+
+Options:
+  --token-param    Query-param name for the token (default: token)
+  --iterations     Reproduce count (default: 3)
+  --max-time       curl timeout seconds (default: 45)
+  --region         AWS region (default: us-east-1)
+  --buffer         Log-window buffer seconds each side (default: 120)
+  --wait-logs      Seconds to wait before querying Athena
+                   (ALB logs lag ~5 min; use 300 right after reproducing; default: 0)
+  -h, --help       This help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --url) URL="$2"; shift 2;;
+    --token) TOKEN="$2"; shift 2;;
+    --token-param) TOKEN_PARAM="$2"; shift 2;;
+    --iterations) ITERATIONS="$2"; shift 2;;
+    --max-time) MAX_TIME="$2"; shift 2;;
+    --region) REGION="$2"; shift 2;;
+    --athena-db) ATHENA_DB="$2"; shift 2;;
+    --athena-table) ATHENA_TABLE="$2"; shift 2;;
+    --athena-output) ATHENA_OUTPUT="$2"; shift 2;;
+    --buffer) WINDOW_BUFFER_SEC="$2"; shift 2;;
+    --wait-logs) LOG_WAIT_SEC="$2"; shift 2;;
+    -h|--help) usage; exit 0;;
+    *) echo "Unknown arg: $1" >&2; usage; exit 1;;
+  esac
+done
+
+# --------------------------- preflight --------------------------------------
+for c in curl aws jq; do
+  command -v "$c" >/dev/null || { echo "Missing dependency: $c" >&2; exit 1; }
+done
+
+missing=()
+[[ -z "$URL" ]]            && missing+=(--url)
+[[ -z "$TOKEN" ]]         && missing+=(--token)
+[[ -z "$ATHENA_DB" ]]     && missing+=(--athena-db)
+[[ -z "$ATHENA_TABLE" ]]  && missing+=(--athena-table)
+[[ -z "$ATHENA_OUTPUT" ]] && missing+=(--athena-output)
+if (( ${#missing[@]} )); then
+  echo "Missing required: ${missing[*]}" >&2; echo; usage; exit 1
+fi
+
+# cross-platform epoch -> ISO8601 UTC (GNU date, then BSD/macOS fallback)
+fmt_epoch() { date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ; }
+redact()    { local t="$1"; echo "${t:0:4}…(${#t} chars)"; }
+
+echo "== AWS identity / target (confirm this is the intended PROD account) =="
+aws sts get-caller-identity --query '{Account:Account,Arn:Arn}' --output table || true
+echo "Region:     $REGION"
+echo "URL:        $URL?$TOKEN_PARAM=$(redact "$TOKEN")"
+echo "Reproduce:  $ITERATIONS request(s), curl max ${MAX_TIME}s"
+echo "!! Sends GET requests to the URL above — do NOT use a control/mutating endpoint. !!"
+echo
+
+# --------------------------- reproduce --------------------------------------
+full_url="${URL}?${TOKEN_PARAM}=${TOKEN}"
+[[ "$URL" == *\?* ]] && full_url="${URL}&${TOKEN_PARAM}=${TOKEN}"   # URL already had a query
+
+hdr="$(mktemp)"; trap 'rm -f "$hdr"' EXIT
+start_epoch=$(date +%s)
+saw_504=0
+echo "== Reproduce loop =="
+for i in $(seq 1 "$ITERATIONS"); do
+  rc=0
+  out=$(curl -sS -o /dev/null -D "$hdr" \
+        -w '%{http_code} %{time_starttransfer} %{time_total}' \
+        --max-time "$MAX_TIME" "$full_url" 2>/dev/null) || rc=$?
+  code=$(awk '{print $1}' <<<"$out"); ttfb=$(awk '{print $2}' <<<"$out"); total=$(awk '{print $3}' <<<"$out")
+  [[ "$code" == "504" ]] && saw_504=1
+  layer="unknown"
+  if   grep -qiE 'x-cache: *error from cloudfront|via:.*cloudfront|x-amz-cf-id' "$hdr"; then layer="CloudFront"
+  elif grep -qiE '^server: *awselb' "$hdr"; then layer="ALB"; fi
+  cfid=$(grep -i '^x-amz-cf-id:' "$hdr" | tr -d '\r' | awk '{print $2}' || true)
+  printf '  try %s: HTTP %s  ttfb=%ss  total=%ss  answered_by=%s  curl_rc=%s %s\n' \
+    "$i" "$code" "$ttfb" "$total" "$layer" "$rc" "${cfid:+cf-id=$cfid}"
+done
+end_epoch=$(date +%s)
+
+win_start=$(fmt_epoch $(( start_epoch - WINDOW_BUFFER_SEC )))
+win_end=$(fmt_epoch $(( end_epoch   + WINDOW_BUFFER_SEC )))
+echo
+echo "Log window (UTC): $win_start  ->  $win_end"
+(( saw_504 == 0 )) && echo "NOTE: no 504 seen from curl this run — the query may return nothing."
+
+if (( LOG_WAIT_SEC > 0 )); then
+  echo "Waiting ${LOG_WAIT_SEC}s for ALB to deliver logs to S3 (delivery lags ~5 min)..."
+  sleep "$LOG_WAIT_SEC"
+fi
+
+# --------------------------- Athena query -----------------------------------
+read -r -d '' SQL <<SQL || true
+SELECT time, elb_status_code, target_status_code,
+       request_processing_time, target_processing_time, response_processing_time,
+       request_verb, request_url, target_ip, target_port, trace_id
+FROM   "${ATHENA_DB}"."${ATHENA_TABLE}"
+WHERE  elb_status_code = '504'
+  AND  from_iso8601_timestamp(time) BETWEEN from_iso8601_timestamp('${win_start}')
+                                        AND from_iso8601_timestamp('${win_end}')
+ORDER  BY time DESC
+LIMIT  50
+SQL
+
+echo "== Querying ALB access logs (504s in window) =="
+qid=$(aws athena start-query-execution --region "$REGION" \
+        --query-string "$SQL" \
+        --query-execution-context "Database=${ATHENA_DB}" \
+        --result-configuration "OutputLocation=${ATHENA_OUTPUT}" \
+        --output text --query 'QueryExecutionId')
+
+for _ in $(seq 1 60); do
+  st=$(aws athena get-query-execution --region "$REGION" --query-execution-id "$qid" \
+        --output text --query 'QueryExecution.Status.State')
+  case "$st" in
+    SUCCEEDED) break;;
+    FAILED|CANCELLED)
+      reason=$(aws athena get-query-execution --region "$REGION" --query-execution-id "$qid" \
+                --output text --query 'QueryExecution.Status.StateChangeReason')
+      echo "Athena query $st: $reason" >&2; exit 1;;
+    *) sleep 2;;
+  esac
+done
+
+echo
+aws athena get-query-results --region "$REGION" --query-execution-id "$qid" --output json \
+| jq -r '.ResultSet.Rows[] | [.Data[].VarCharValue // "-"] | @tsv' \
+| column -t -s "$(printf '\t')" || true
+
+echo
+echo "Full results CSV: ${ATHENA_OUTPUT%/}/${qid}.csv"
+cat <<'EOF'
+
+How to read it:
+  target_status_code = "-"  and  target_processing_time ~30  -> the target never
+      responded in time; the ALB/CloudFront cut the request. Backend-slow confirmed.
+  target_status_code = 504                                    -> something behind the
+      target returned 504 (e.g. the legacy API or a downstream call).
+
+  Take a trace_id from above and jump straight to the app-side stack trace:
+      kubectl logs -n <ns> -l <selector> --since=15m | grep '<trace_id>'
+EOF
