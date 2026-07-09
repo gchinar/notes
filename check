@@ -1,63 +1,90 @@
-That key spelling is worth a hard look before anything else: you wrote `COLLABO_TOKEN::COLABO_TOKEN` — the first half is `COLLABO` (double L) and the second is `COLABO` (single L). If the code that *writes* the token and the code that *reads* it don't spell it identically, Redis will hold the token fine but the reader will never find it — which looks exactly like "Redis isn't getting it." Confirm the exact spelling on both the write and read side first.
+The three clues together actually point pretty hard at a root cause before you run anything:
 
-Now the exact commands for that key (run inside your authenticated `redis-cli` session, read-only):
+- **Exactly 30 seconds** = you're hitting a *fixed timeout*, not gradual slowness. Something in the chain has a 30s ceiling and cuts the request.
+- **Token in the URL** = this is almost certainly the **SSE/Stream endpoint** (the browser's `EventSource` can't send auth headers, so tokens get passed as a query param) — or a per-device data endpoint authenticated the same way.
+- **15 devices** = the backend work scales with device count and is taking *longer* than 30s to produce a response.
 
-**1. Is the key there, and healthy?**
+This is very likely the SSE-idle-timeout / slow-first-byte issue flagged throughout the earlier docs. Two prime suspects for the 30s cutoff — check both first:
 
+**1. CloudFront origin response timeout (defaults to exactly 30s for custom origins — top suspect)**
+
+```bash
+aws cloudfront get-distribution-config --id <dist-id> \
+  --query 'DistributionConfig.Origins.Items[*].{Origin:DomainName,ResponseTimeout:CustomOriginConfig.OriginReadTimeout,KeepAlive:CustomOriginConfig.OriginKeepaliveTimeout}'
 ```
-EXISTS COLLABO_TOKEN::COLABO_TOKEN     # 1 = present, 0 = missing
-TYPE   COLLABO_TOKEN::COLABO_TOKEN     # likely string
-TTL    COLLABO_TOKEN::COLABO_TOKEN     # secs left; -1 = no expiry set, -2 = key absent
-STRLEN COLLABO_TOKEN::COLABO_TOKEN     # >0 confirms it's populated, without printing the token
-```
+If `ResponseTimeout` is 30 and the origin takes longer than that to send the first byte, CloudFront returns a 504 at exactly 30s.
 
-`-2` on TTL = never written (or already evicted/expired). `-1` = written but no expiry — suspicious if this token is supposed to refresh.
+**2. ALB idle timeout**
 
-**2. Catch any suffixed variants (per-user/per-session keys)**
-
-In case the real keys have more appended (e.g. a user ID):
-
-```
-redis-cli -h <endpoint> -p 6379 --tls --scan --pattern 'COLLABO_TOKEN::COLABO_TOKEN*'
-redis-cli -h <endpoint> -p 6379 --tls --scan --pattern 'COLLABO_TOKEN*'    # both spellings, wider net
-```
-
-Run the wider `COLLABO_TOKEN*` one specifically to see whether **both** spellings exist as keys — if you see the single-L and double-L versions both present, that's your bug confirmed.
-
-**3. Only if you must inspect the value** (it's a live credential — don't paste it anywhere shared)
-
-```
-GET COLLABO_TOKEN::COLABO_TOKEN
+```bash
+aws elbv2 describe-load-balancer-attributes --load-balancer-arn <lb-arn> \
+  --query "Attributes[?Key=='idle_timeout.timeout_seconds']"
 ```
 
-Prefer comparing lengths or a hash over eyeballing the raw token unless you're specifically validating it against what the upstream issued.
+**3. Reproduce and measure where it dies — TTFB is the key number**
 
-**4. Confirm it's actually being written / refreshed**
+```bash
+# The exact failing request (token-in-url). See if it hangs ~30s then 504s.
+curl -sS -o /dev/null -w 'code=%{http_code} ttfb=%{time_starttransfer}s total=%{time_total}s\n' \
+  'https://<url>/<path>?token=<...>'
 
-Snapshot the TTL, wait through a refresh cycle (or trigger the flow on a test account), snapshot again:
-
-```
-TTL COLLABO_TOKEN::COLABO_TOKEN        # note the number
-# ... wait / trigger token issuance ...
-TTL COLLABO_TOKEN::COLABO_TOKEN        # should reset upward if it's being refreshed
-```
-
-If the key is missing before the flow and present after, Redis is receiving it. If it stays missing, the write isn't reaching Redis — go to the app side.
-
-**5. Rule out eviction (silent token loss)**
-
-```
-INFO stats | grep -E 'evicted_keys|expired_keys|keyspace_misses'
+# If it's the SSE stream — do events arrive, or does it stall then drop at 30s?
+curl -N -sS -w '\nHTTP %{http_code} total %{time_total}s\n' 'https://<url>/<sse-path>?token=<...>'
 ```
 
-Rising `evicted_keys` = memory pressure is dropping the token before its TTL. `keyspace_misses` climbing = the app keeps looking for a token that isn't there.
+If `ttfb` climbs toward 30s and then errors, the **backend isn't producing a first byte in time** and a proxy is killing it. If events never flush but the backend is working, suspect **edge buffering** of the SSE stream.
 
-**6. App side — is the writer erroring?**
+**4. Confirm which layer generated the timeout (ALB access logs are decisive)**
 
+```bash
+export START=$(date -u -d '30 min ago' +%Y-%m-%dT%H:%M:%SZ); export END=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# ELB-generated 5xx (504 = target too slow) vs target-generated 5xx
+aws cloudwatch get-metric-statistics --namespace AWS/ApplicationELB --metric-name HTTPCode_ELB_5XX_Count \
+  --dimensions Name=LoadBalancer,Value=<lb-id> --start-time $START --end-time $END --period 60 --statistics Sum
+aws cloudwatch get-metric-statistics --namespace AWS/ApplicationELB --metric-name TargetResponseTime \
+  --dimensions Name=LoadBalancer,Value=<lb-id> --start-time $START --end-time $END --period 60 --statistics Average Maximum
 ```
-kubectl logs <oauth-pod> -n $NS --since=15m | grep -iE 'COLLABO_TOKEN|COLABO_TOKEN|redis|serializ|timeout' | tail -40
+
+In the ALB access logs (S3/Athena), look at `target_processing_time` for the failing request: a value near 30 with `elb_status_code=504` and `target_status_code="-"` confirms the **target took too long and the ALB/CloudFront cut it** — not the app returning an error.
+
+**5. Now find WHY the backend is slow for 15 devices**
+
+The likely culprit is a serial fan-out or N+1: 15 devices × a slow per-device call (downstream/appliance/DB) exceeding 30s.
+
+```bash
+# App logs for the slow request — look for the device loop / repeated calls
+kubectl logs <api-pod> -n $NS --since=10m | grep -iE 'device|token|timeout|slow' | tail -60
+
+# Are threads blocked waiting on downstream/DB while it hangs? (thread dump, read-only)
+kubectl exec <api-pod> -n $NS -- curl -s localhost:8080/actuator/threaddump \
+  | jq -r '.threads[] | select(.threadState=="BLOCKED" or .threadState=="WAITING") | .threadName' | sort | uniq -c | sort -rn | head
+
+# Per-endpoint latency the app itself sees
+kubectl exec <api-pod> -n $NS -- curl -s 'localhost:8080/actuator/metrics/http.server.requests' | jq .
+kubectl top pods -n $NS        # is the pod CPU-saturated during the hang?
 ```
 
-Watch for serialization errors, Redis timeouts, or the app logging one spelling while you're checking the other.
+**6. Is a DB query stuck ~30s? (run WHILE reproducing — read-only)**
 
-My honest first suspicion, given what you typed, is the double-L/single-L mismatch — check that before digging deeper. Want me to give you a one-shot script that checks both spellings and reports which one Redis actually holds?
+```bash
+mysql -h <rds-endpoint> -u <ro-user> -p \
+  -e "SELECT id,time,state,LEFT(info,120) FROM information_schema.processlist WHERE command<>'Sleep' AND time>3 ORDER BY time DESC;"
+```
+A query sitting at ~30s here is your smoking gun — likely one per device (N+1) or a missing index.
+
+**7. Token lookup latency (ties to the Redis work)**
+
+```bash
+redis-cli -h <endpoint> -p 6379 --tls --latency        # baseline round-trip
+redis-cli -h <endpoint> -p 6379 --tls SLOWLOG GET 10    # slow ops (e.g. token validation × 15)
+```
+If the token is re-validated once *per device*, that's 15 Redis/JWKS lookups per click — check whether validation is cached or repeated.
+
+**One thing to rule in/out on the "token in URL" itself:** a very long token can blow past URL/header size limits, but that throws a fast 400/414/431 — not a 30s hang — so it's probably not the *timeout* cause here, just how this endpoint authenticates. Worth a quick check though:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code} url_len=%{size_request}\n' 'https://<url>/<path>?token=<...>'
+```
+
+My money's on **CloudFront's 30s origin response timeout firing because the 15-device fan-out (or its token re-validation) takes longer than 30s to first byte.** Start with steps 1–4 to confirm the layer, then 5–7 for the cause. Want a single script that runs the reproduce-and-measure (step 3) plus pulls the ALB 504/TargetResponseTime metrics in one go, so you get the layer and the timing in one shot?
