@@ -62,6 +62,14 @@ METRICS = [
     ("ReplicationLag",                           "Replication Lag  (worst node)",               "Average", "MAX", "Seconds"),
 ]
 
+# Colors assigned EXPLICITLY to individual node lines so CloudWatch's auto-palette
+# can't reuse an aggregate color. The two aggregate colors are filtered out of this
+# list at build time (see build_dashboard), guaranteeing no collision.
+NODE_PALETTE = [
+    "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
+    "#bcbd22", "#17becf", "#aec7e8", "#ffbb78", "#c5b0d5",
+]
+
 
 def aws_json(args):
     proc = subprocess.run(["aws", *args, "--output", "json"],
@@ -100,16 +108,19 @@ def short(node_id):
     return node_id.split("-", 1)[-1] if "-" in node_id else node_id
 
 
-def cluster_widget(title, metric_name, stat, agg, ylabel, region, nodes, color, y_max=None):
+def cluster_widget(title, metric_name, stat, agg, ylabel, region, nodes, color, node_colors, y_max=None):
     """One chart for ONE cluster.
     Node metrics are visible:false -> present in the legend (deselected/greyed),
-    click to draw. The aggregate expression is the only line drawn by default."""
+    click to draw. The aggregate expression is the only line drawn by default.
+    Each node gets an EXPLICIT color from node_colors so a revealed node line can
+    never collide with the aggregate color."""
     metrics, ids = [], []
     for i, node in enumerate(nodes):
         mid = f"m{i}"
         ids.append(mid)
         metrics.append(["AWS/ElastiCache", metric_name, "CacheClusterId", node,
-                        {"id": mid, "stat": stat, "label": short(node), "visible": False}])
+                        {"id": mid, "stat": stat, "label": short(node),
+                         "color": node_colors[i % len(node_colors)], "visible": False}])
     metrics.append([{"expression": f"{agg}([{','.join(ids)}])",
                      "label": f"All nodes ({agg})", "id": "agg", "color": color}])
     left_axis = {"label": ylabel, "showUnits": False, "min": 0}
@@ -125,7 +136,7 @@ def cluster_widget(title, metric_name, stat, agg, ylabel, region, nodes, color, 
     }
 
 
-def cluster_hitrate_widget(title, region, nodes, color):
+def cluster_hitrate_widget(title, region, nodes, color, node_colors):
     """Hit rate %: aggregate drawn by default; per-node rate lines in the legend
     (deselected, click to draw). Raw hits/misses are hidden inputs."""
     metrics, h, m = [], [], []
@@ -139,7 +150,8 @@ def cluster_hitrate_widget(title, region, nodes, color):
         m.append(f"mm{i}")
     for i in range(len(nodes)):
         metrics.append([{"expression": f"100*h{i}/(h{i}+mm{i}+1)",
-                         "label": short(nodes[i]), "id": f"hr{i}", "visible": False}])
+                         "label": short(nodes[i]), "id": f"hr{i}",
+                         "color": node_colors[i % len(node_colors)], "visible": False}])
     hs, ms = f"SUM([{','.join(h)}])", f"SUM([{','.join(m)}])"
     metrics.append([{"expression": f"100*{hs}/({hs}+{ms}+1)",
                      "label": "All nodes (AVG)", "id": "hragg", "color": color}])
@@ -164,6 +176,11 @@ def build_dashboard(region, old, new, old_color, new_color):
     (old_nodes, old_type, old_ver) = old
     (new_nodes, new_type, new_ver) = new
 
+    # node-line colors = palette minus the two aggregate colors, so a revealed
+    # node line can never match the aggregate (blue/green) lines
+    reserved = {old_color.lower(), new_color.lower()}
+    node_colors = [c for c in NODE_PALETTE if c.lower() not in reserved] or NODE_PALETTE
+
     header_md = (
         f"# Redis / Valkey Deployment Comparison  -  side by side\n"
         f"**LEFT = OLD**  ·  **RIGHT = NEW**  ·  one metric per row, two charts\n\n"
@@ -185,13 +202,13 @@ def build_dashboard(region, old, new, old_color, new_color):
     y = 6
     for (m, t, stat, agg, yl) in METRICS:
         y_max = 100 if yl == "Percent" else None
-        lw = cluster_widget(f"{t}  |  OLD", m, stat, agg, yl, region, old_nodes, old_color, y_max)
-        rw = cluster_widget(f"{t}  |  NEW", m, stat, agg, yl, region, new_nodes, new_color, y_max)
+        lw = cluster_widget(f"{t}  |  OLD", m, stat, agg, yl, region, old_nodes, old_color, node_colors, y_max)
+        rw = cluster_widget(f"{t}  |  NEW", m, stat, agg, yl, region, new_nodes, new_color, node_colors, y_max)
         widgets += place_row(lw, rw, y)
         y += 6
 
-    lw = cluster_hitrate_widget("Cache Hit Rate %  |  OLD", region, old_nodes, old_color)
-    rw = cluster_hitrate_widget("Cache Hit Rate %  |  NEW", region, new_nodes, new_color)
+    lw = cluster_hitrate_widget("Cache Hit Rate %  |  OLD", region, old_nodes, old_color, node_colors)
+    rw = cluster_hitrate_widget("Cache Hit Rate %  |  NEW", region, new_nodes, new_color, node_colors)
     widgets += place_row(lw, rw, y)
 
     return {"widgets": widgets}
