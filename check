@@ -1,62 +1,230 @@
+#!/usr/bin/env python3
+"""
+build_redis_compare_dashboard.py
 
-That "broken until refresh, then fine" pattern is a specific and recognizable class of bug — and it points away from your backend. If the server or a proxy were the problem, a refresh wouldn't reliably fix it. The fact that reloading always works means the initial page state is arriving broken and the reload repairs it. Given your stack, three usual causes, in order of likelihood:
+Create a CloudWatch dashboard that compares two ElastiCache (Valkey/Redis)
+replication groups side by side -- e.g. an OLD cluster vs a NEW one you cut
+over to during a production deployment.
 
-**1. The SSE/stream connection dies or never establishes on first load (most likely)**
+What it does:
+  * Auto-discovers each replication group's member nodes, so it adapts to
+    2-node vs 4-node clusters with no hardcoding.
+  * Reads each cluster's real node type and engine version and puts them in a
+    header, so the dashboard is self-documenting and accurate.
+  * Builds one widget per metric with OLD (blue) and NEW (orange) plotted
+    TOGETHER, aggregated across each cluster's nodes via metric math.
+  * Calls cloudwatch put-dashboard.
 
-The Monitor/Control tabs depend on the live stream. If the `EventSource` connection drops (idle timeout, network blip, a 504 like you've been chasing) and the frontend has **no auto-reconnect**, the tab goes silent until a refresh forces a fresh connection. This ties directly to the 30s timeout work.
+Safety: everything it reads is read-only. The ONLY write is creating/replacing
+the named dashboard. Uses the AWS CLI under the hood (no boto3 needed) -- you
+just need `aws` configured with CloudWatch + ElastiCache read + PutDashboard.
 
-Check in the browser first — DevTools while it's broken (don't refresh yet):
+Usage:
+  ./build_redis_compare_dashboard.py \
+      --old-rg <old-replication-group-id> \
+      --new-rg <new-replication-group-id> \
+      --region <region>            # default us-east-1
+      [--name <dashboard-name>]
+      [--old-label "..."] [--new-label "..."]
+"""
+import argparse
+import json
+import subprocess
+import sys
+import tempfile
 
-- **Network tab → filter "eventsource" / "stream"** → is the connection `200` and open, or has it gone red/failed/pending? A closed stream with nothing reconnecting is your answer.
-- **Console** → look for `EventSource` errors, unhandled promise rejections, or "Maximum reconnect" messages.
+OLD_COLOR = "#1f77b4"   # blue
+NEW_COLOR = "#ff7f0e"   # orange
 
-Server-side, confirm whether the stream is being cut:
+# metric_name, widget title, per-node statistic, cross-node aggregation, y-axis label
+METRICS = [
+    ("NetworkBandwidthOutAllowanceExceeded", "Net Bandwidth OUT Allowance Exceeded  <-- KEY", "Sum", "SUM", "Count (shaped)"),
+    ("NetworkBytesOut",                       "Network Bytes Out (cluster total)",             "Average", "SUM", "Bytes"),
+    ("NetworkBandwidthInAllowanceExceeded",  "Net Bandwidth IN Allowance Exceeded",           "Sum", "SUM", "Count (shaped)"),
+    ("NetworkBytesIn",                        "Network Bytes In (cluster total)",              "Average", "SUM", "Bytes"),
+    ("NetworkPacketsPerSecondAllowanceExceeded", "PPS Allowance Exceeded",                     "Sum", "SUM", "Count"),
+    ("NetworkConntrackAllowanceExceeded",    "Conntrack Allowance Exceeded",                  "Sum", "SUM", "Count"),
+    ("EngineCPUUtilization",                  "Engine CPU %  (max node - single-thread)",      "Average", "MAX", "Percent"),
+    ("CPUUtilization",                        "Host CPU %  (max node)",                        "Average", "MAX", "Percent"),
+    ("Evictions",                             "Evictions (cluster total)",                     "Sum", "SUM", "Count"),
+    ("DatabaseMemoryUsagePercentage",         "Memory Used %  (max node)",                     "Average", "MAX", "Percent"),
+    ("FreeableMemory",                        "Freeable Memory  (min node)",                   "Average", "MIN", "Bytes"),
+    ("CurrConnections",                       "Current Connections (cluster total)",           "Average", "SUM", "Count"),
+    ("SuccessfulReadRequestLatency",          "Read Latency  (avg)",                           "Average", "AVG", "Microseconds"),
+    ("SuccessfulWriteRequestLatency",         "Write Latency  (avg)",                          "Average", "AVG", "Microseconds"),
+    ("ReplicationLag",                        "Replication Lag  (max node)",                   "Average", "MAX", "Seconds"),
+]
 
-```bash
-# SSE connection lifetime / drops in the stream API
-kubectl logs -n $NS -l <stream-api-selector> --since=30m | grep -iE 'sse|eventsource|stream|disconnect|complete|broken pipe|timeout' | tail -60
 
-# Are connections being reset around a fixed interval (idle timeout)?
-kubectl logs -n $NS -l <stream-api-selector> --since=30m | grep -iE 'connection (closed|reset)' | tail -40
-```
+def aws_json(args):
+    proc = subprocess.run(["aws", *args, "--output", "json"],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        sys.exit(f"ERROR: `aws {' '.join(args)}` failed:\n{proc.stderr.strip()}")
+    return json.loads(proc.stdout or "{}")
 
-**2. A race condition / token-timing issue on initial render**
 
-The tab may render before the token is ready or before initial device state has loaded. On refresh the data's already warm (cached/session established), so it works. This connects to the collabo-token-in-Redis thread — if the token isn't in Redis yet on first load but is by the refresh, the first attempt fails auth silently.
+def describe_cluster(rg_id, region):
+    """Return (member_node_ids, node_type, engine_version) for a replication group."""
+    data = aws_json(["elasticache", "describe-replication-groups",
+                     "--replication-group-id", rg_id, "--region", region])
+    groups = data.get("ReplicationGroups", [])
+    if not groups:
+        sys.exit(f"ERROR: replication group not found: {rg_id}")
+    g = groups[0]
+    nodes = g.get("MemberClusters", [])
+    if not nodes:
+        sys.exit(f"ERROR: no member nodes found for {rg_id}")
+    node_type = g.get("CacheNodeType", "n/a")
+    # engine version isn't always on the RG object; read it from a member node (best effort)
+    version = "n/a"
+    try:
+        cc = aws_json(["elasticache", "describe-cache-clusters",
+                       "--cache-cluster-id", nodes[0], "--region", region])
+        clusters = cc.get("CacheClusters", [])
+        if clusters:
+            engine = clusters[0].get("Engine", "")
+            version = f"{engine} {clusters[0].get('EngineVersion', '')}".strip()
+    except SystemExit:
+        pass
+    return nodes, node_type, version
 
-```bash
-# 401/403 on the monitor/control data calls that then succeed on refresh
-kubectl logs -n $NS -l <main-api-selector> --since=30m | grep -iE '401|403|unauthor|token|forbidden' | tail -60
 
-# In DevTools (broken state): Network tab — are the tab's XHR/fetch calls 401/403/pending,
-# while the same calls after refresh are 200?
-```
+def raw_metric(metric_name, node, mid, stat):
+    return ["AWS/ElastiCache", metric_name, "CacheClusterId", node,
+            {"id": mid, "stat": stat, "visible": False}]
 
-**3. Intermittent 504 on the tab's data fetch (the bug you're already tracking)**
 
-If the Monitor/Control tab's initial fetch sometimes hits the slow 15-device path and 504s, the tab renders empty; refresh retries and sometimes lands under the timeout. Same root cause, different symptom — reuse the repro script pointed at the tab's specific endpoint:
+def metric_widget(title, metric_name, per_node_stat, agg, ylabel, region,
+                  old_nodes, new_nodes, old_label, new_label):
+    metrics, old_ids, new_ids = [], [], []
+    for i, node in enumerate(old_nodes):
+        mid = f"o{i}"; old_ids.append(mid)
+        metrics.append(raw_metric(metric_name, node, mid, per_node_stat))
+    metrics.append([{"expression": f"{agg}([{','.join(old_ids)}])",
+                     "label": old_label, "id": "e_old", "color": OLD_COLOR}])
+    for i, node in enumerate(new_nodes):
+        mid = f"n{i}"; new_ids.append(mid)
+        metrics.append(raw_metric(metric_name, node, mid, per_node_stat))
+    metrics.append([{"expression": f"{agg}([{','.join(new_ids)}])",
+                     "label": new_label, "id": "e_new", "color": NEW_COLOR}])
+    return {
+        "type": "metric",
+        "properties": {
+            "title": title,
+            "region": region,
+            "view": "timeSeries",
+            "stacked": False,
+            "period": 60,
+            "yAxis": {"left": {"label": ylabel, "showUnits": False}},
+            "metrics": metrics,
+        },
+    }
 
-```bash
-./repro-504.sh --url 'https://<host>/<monitor-or-control-data-path>' --token '<token>' \
-  --athena-db <db> --athena-table <tbl> --athena-output 's3://.../query/' --wait-logs 300
-```
 
-**The single most useful diagnostic step:** next time it breaks, open DevTools **before refreshing** and capture the **Network** tab (screenshot the failed/pending requests) and the **Console**. That one capture usually tells you instantly which of the three it is — a dead EventSource, a 401, or a 504. Everything else is confirmation.
+def hitrate_widget(region, old_nodes, new_nodes, old_label, new_label):
+    metrics = []
 
-Got it — so the symptom shows up in the page itself. That actually helps narrow it, but *how* it looks changes the diagnosis, so tell me which of these the broken tab shows:
+    def side(nodes, prefix, label, color):
+        h, m = [], []
+        for i, node in enumerate(nodes):
+            metrics.append(raw_metric("CacheHits", node, f"{prefix}h{i}", "Sum")); h.append(f"{prefix}h{i}")
+        for i, node in enumerate(nodes):
+            metrics.append(raw_metric("CacheMisses", node, f"{prefix}m{i}", "Sum")); m.append(f"{prefix}m{i}")
+        hs, ms = f"SUM([{','.join(h)}])", f"SUM([{','.join(m)}])"
+        # +1 in denominator guards against divide-by-zero when a cluster is idle
+        metrics.append([{"expression": f"100*{hs}/({hs}+{ms}+1)",
+                         "label": label, "id": f"hr_{prefix}", "color": color}])
 
-- **Blank / empty panel** → the data or stream never loaded (points to a dead EventSource or a 504/401 on the initial fetch).
-- **Spinner that never finishes** → the request is hung/pending (the 30s timeout hang).
-- **An actual error message with text** → read me that text — it's often the answer directly (an error boundary or a surfaced API error).
-- **Controls greyed out / disabled** → device state never arrived, so the UI thinks it's offline.
+    side(old_nodes, "o", old_label, OLD_COLOR)
+    side(new_nodes, "n", new_label, NEW_COLOR)
+    return {
+        "type": "metric",
+        "properties": {
+            "title": "Cache Hit Rate %  (cluster)",
+            "region": region, "view": "timeSeries", "period": 60,
+            "yAxis": {"left": {"label": "Percent", "showUnits": False, "min": 0, "max": 100}},
+            "metrics": metrics,
+        },
+    }
 
-Whichever it is, here's the 20-second capture that pins the real cause. Do this **while the tab is broken, before refreshing**:
 
-1. Press **F12** (or right-click the page → **Inspect**) to open DevTools.
-2. Click the **Console** tab — if there's a red error, that's your top clue. Copy the first line.
-3. Click the **Network** tab, tick **Preserve log**, then click the Monitor/Control tab again to re-trigger it. Filter to **Fetch/XHR** and look at the **EventStream** entry too.
-4. Find any row that's **red (failed)** or stuck **(pending)** → click it → note the **Status**: `401/403` (auth/token), `504`/pending (the timeout), or `failed`/`canceled` (dead stream).
+def build_dashboard(region, old, new, old_label, new_label):
+    (old_nodes, old_type, old_ver) = old
+    (new_nodes, new_type, new_ver) = new
 
-Then send me either the **exact error text on the page** or the **status of that failing request**, and I'll tell you which of the three causes it is and the precise fix — reconnect logic for a dead stream, the token-timing race, or the 15-device 504 path we've been tracking.
+    header_md = (
+        f"# Redis / Valkey Deployment Comparison\n"
+        f"**Blue = OLD**  ·  **Orange = NEW**  ·  all widgets aggregate across each cluster's nodes\n\n"
+        f"| | OLD | NEW |\n|---|---|---|\n"
+        f"| Engine / version | {old_ver} | {new_ver} |\n"
+        f"| Node type | {old_type} | {new_type} |\n"
+        f"| Nodes | {len(old_nodes)} | {len(new_nodes)} |\n\n"
+        f"**Headline check:** *Net Bandwidth OUT Allowance Exceeded* should fall toward **0** on NEW "
+        f"(larger nodes raise the network baseline). If it's still climbing, the bottleneck isn't node size."
+    )
+    widgets = [{"type": "text", "x": 0, "y": 0, "width": 24, "height": 5,
+                "properties": {"markdown": header_md}}]
 
-My strong guess, given everything so far: it's the **live stream not reconnecting** after it drops, so the tab sits with stale/empty state until a refresh forces a new connection. The Network tab will confirm that in one look — a closed EventStream row with nothing retrying.
+    panels = [metric_widget(t, m, s, a, y, region, old_nodes, new_nodes, old_label, new_label)
+              for (m, t, s, a, y) in METRICS]
+    panels.append(hitrate_widget(region, old_nodes, new_nodes, old_label, new_label))
+
+    x, y, col = 0, 5, 0
+    for p in panels:
+        p["x"] = 0 if col == 0 else 12
+        p["y"] = y
+        p["width"] = 12
+        p["height"] = 6
+        col ^= 1
+        if col == 0:
+            y += 6
+    return {"widgets": widgets}
+
+
+def put_dashboard(name, body, region):
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump(body, f)
+        path = f.name
+    out = aws_json(["cloudwatch", "put-dashboard",
+                    "--dashboard-name", name,
+                    "--dashboard-body", f"file://{path}",
+                    "--region", region])
+    msgs = out.get("DashboardValidationMessages", [])
+    if msgs:
+        print("Validation messages from CloudWatch:")
+        for m in msgs:
+            print(f"  - {m}")
+    return path
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Generate a CloudWatch dashboard comparing two ElastiCache clusters.")
+    ap.add_argument("--old-rg", required=True, help="OLD replication group id")
+    ap.add_argument("--new-rg", required=True, help="NEW replication group id")
+    ap.add_argument("--region", default="us-east-1")
+    ap.add_argument("--name", default="redis-valkey-old-vs-new")
+    ap.add_argument("--old-label", default=None, help="Legend label for OLD (defaults to id + node type)")
+    ap.add_argument("--new-label", default=None, help="Legend label for NEW (defaults to id + node type)")
+    args = ap.parse_args()
+
+    print(f"Discovering nodes in {args.region} ...")
+    old = describe_cluster(args.old_rg, args.region)
+    new = describe_cluster(args.new_rg, args.region)
+    old_label = args.old_label or f"OLD: {args.old_rg} ({old[1]} x{len(old[0])})"
+    new_label = args.new_label or f"NEW: {args.new_rg} ({new[1]} x{len(new[0])})"
+    print(f"  OLD {args.old_rg}: {len(old[0])} node(s), {old[1]}, {old[2]}")
+    print(f"  NEW {args.new_rg}: {len(new[0])} node(s), {new[1]}, {new[2]}")
+
+    body = build_dashboard(args.region, old, new, old_label, new_label)
+    path = put_dashboard(args.name, body, args.region)
+
+    url = (f"https://{args.region}.console.aws.amazon.com/cloudwatch/home"
+           f"?region={args.region}#dashboards/dashboard/{args.name}")
+    print(f"\nDashboard '{args.name}' created/updated.")
+    print(f"Open it: {url}")
+    print(f"(dashboard JSON written to {path} if you want to version-control it)")
+
+
+if __name__ == "__main__":
+    main()
