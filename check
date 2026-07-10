@@ -8,21 +8,23 @@ replication groups:
     LEFT column  = OLD cluster  (its own color)
     RIGHT column = NEW cluster  (its own color)
 
-Each metric = one row of two charts (OLD | NEW). Every chart draws EACH NODE'S
-line PLUS a bold "All nodes" aggregate line, so you can:
-  * see the sum/average at a glance (the bold aggregate, in the column color), and
-  * click any node name in the chart legend to isolate or hide that node
-    (CloudWatch's native per-series toggle).
+Each metric = one row of two charts (OLD | NEW).
+
+Default view per chart:
+  * ONLY the bold "All nodes" aggregate line is drawn (in the column color).
+  * Every individual node also appears in the legend, but DESELECTED (greyed).
+    Click a node's name in the legend to draw its line -- click one, several,
+    or all of them; click again to hide. (This is CloudWatch's native legend
+    toggle; it's a live view change and does not alter the saved dashboard.)
 
 Statistics follow AWS guidance:
-  * Gauges  (level at a point in time)  -> Average per node
+  * Gauges (level at a point in time)      -> Average per node
       CPU %, EngineCPU %, memory %, FreeableMemory, CurrConnections,
       read/write latency, ReplicationLag
-  * Counters (events accumulated over the period) -> Sum per node
-      Evictions, CacheHits, CacheMisses, NewConnections, and every
-      ...AllowanceExceeded metric
-Cross-node aggregation is chosen to be meaningful per metric (SUM for totals,
-MAX for "worst node" saturation, MIN for worst-case free memory).
+  * Counters (events over the period)      -> Sum per node
+      Evictions, CacheHits, CacheMisses, NewConnections, all ...AllowanceExceeded
+Cross-node aggregation is meaningful per metric: SUM (totals),
+MAX (worst node), MIN (worst-case free memory).
 
 Safety: everything read is read-only. The ONLY write is creating/replacing the
 named dashboard. Uses the AWS CLI (no boto3). Needs CloudWatch + ElastiCache
@@ -32,8 +34,7 @@ Usage:
   ./build_redis_compare_dashboard.py \
       --old-rg <old-rg-id> --new-rg <new-rg-id> --region <region> \
       [--name <dashboard-name>] \
-      [--old-color '#1f77b4'] [--new-color '#ff7f0e'] \
-      [--nodes show|hide]        # show (default) = per-node lines + aggregate
+      [--old-color '#1f77b4'] [--new-color '#ff7f0e']
 """
 import argparse
 import json
@@ -41,27 +42,21 @@ import subprocess
 import sys
 import tempfile
 
-# metric_name, title, PER-NODE STAT (AWS-recommended), CROSS-NODE AGG, y-axis label
-#   stat:  Average for gauges, Sum for event counters
-#   agg :  SUM (totals) | MAX (worst node) | MIN (worst-case headroom) | AVG
+# metric_name, title, PER-NODE STAT (AWS), CROSS-NODE AGG, y-axis label
 METRICS = [
-    # --- network (the focus of the resize) ---
     ("NetworkBandwidthOutAllowanceExceeded",     "Net Bandwidth OUT Allowance Exceeded  (KEY)", "Sum",     "SUM", "Count (shaped)"),
     ("NetworkBytesOut",                          "Network Bytes Out",                           "Sum",     "SUM", "Bytes"),
     ("NetworkBandwidthInAllowanceExceeded",      "Net Bandwidth IN Allowance Exceeded",         "Sum",     "SUM", "Count (shaped)"),
     ("NetworkBytesIn",                           "Network Bytes In",                            "Sum",     "SUM", "Bytes"),
     ("NetworkPacketsPerSecondAllowanceExceeded", "PPS Allowance Exceeded",                      "Sum",     "SUM", "Count"),
     ("NetworkConntrackAllowanceExceeded",        "Conntrack Allowance Exceeded",                "Sum",     "SUM", "Count"),
-    # --- cpu / memory ---
     ("EngineCPUUtilization",                     "Engine CPU %  (worst node - single-thread)",  "Average", "MAX", "Percent"),
     ("CPUUtilization",                           "Host CPU %  (worst node)",                    "Average", "MAX", "Percent"),
     ("DatabaseMemoryUsagePercentage",            "Memory Used %  (worst node)",                 "Average", "MAX", "Percent"),
     ("FreeableMemory",                           "Freeable Memory  (min node)",                 "Average", "MIN", "Bytes"),
     ("Evictions",                                "Evictions",                                   "Sum",     "SUM", "Count"),
-    # --- connections / throughput ---
     ("CurrConnections",                          "Current Connections",                         "Average", "SUM", "Count"),
     ("NewConnections",                           "New Connections",                             "Sum",     "SUM", "Count"),
-    # --- latency / replication ---
     ("SuccessfulReadRequestLatency",             "Read Latency  (worst node)",                  "Average", "MAX", "Microseconds"),
     ("SuccessfulWriteRequestLatency",            "Write Latency  (worst node)",                 "Average", "MAX", "Microseconds"),
     ("ReplicationLag",                           "Replication Lag  (worst node)",               "Average", "MAX", "Seconds"),
@@ -102,20 +97,19 @@ def describe_cluster(rg_id, region):
 
 
 def short(node_id):
-    # trim the common replication-group prefix so legends stay readable
     return node_id.split("-", 1)[-1] if "-" in node_id else node_id
 
 
-def cluster_widget(title, metric_name, stat, agg, ylabel, region,
-                   nodes, color, show_nodes, y_max=None):
-    """One chart for ONE cluster: every node's line + a bold aggregate line."""
+def cluster_widget(title, metric_name, stat, agg, ylabel, region, nodes, color, y_max=None):
+    """One chart for ONE cluster.
+    Node metrics are visible:false -> present in the legend (deselected/greyed),
+    click to draw. The aggregate expression is the only line drawn by default."""
     metrics, ids = [], []
     for i, node in enumerate(nodes):
         mid = f"m{i}"
         ids.append(mid)
-        opts = {"id": mid, "stat": stat, "label": short(node), "visible": bool(show_nodes)}
-        metrics.append(["AWS/ElastiCache", metric_name, "CacheClusterId", node, opts])
-    # bold aggregate in the cluster's color; label states which function it is
+        metrics.append(["AWS/ElastiCache", metric_name, "CacheClusterId", node,
+                        {"id": mid, "stat": stat, "label": short(node), "visible": False}])
     metrics.append([{"expression": f"{agg}([{','.join(ids)}])",
                      "label": f"All nodes ({agg})", "id": "agg", "color": color}])
     left_axis = {"label": ylabel, "showUnits": False, "min": 0}
@@ -124,40 +118,36 @@ def cluster_widget(title, metric_name, stat, agg, ylabel, region,
     return {
         "type": "metric",
         "properties": {
-            "title": title,
-            "region": region,
-            "view": "timeSeries",
-            "stacked": False,
-            "period": 60,
-            "yAxis": {"left": left_axis},
-            "metrics": metrics,
+            "title": title, "region": region, "view": "timeSeries", "stacked": False,
+            "period": 60, "legend": {"position": "right"},
+            "yAxis": {"left": left_axis}, "metrics": metrics,
         },
     }
 
 
-def cluster_hitrate_widget(title, region, nodes, color, show_nodes):
-    """Cache hit-rate % per node + aggregate, computed from Sum(hits)/Sum(hits+misses)."""
+def cluster_hitrate_widget(title, region, nodes, color):
+    """Hit rate %: aggregate drawn by default; per-node rate lines in the legend
+    (deselected, click to draw). Raw hits/misses are hidden inputs."""
     metrics, h, m = [], [], []
     for i, node in enumerate(nodes):
         metrics.append(["AWS/ElastiCache", "CacheHits", "CacheClusterId", node,
-                        {"id": f"h{i}", "stat": "Sum", "visible": False}])
+                        {"id": f"h{i}", "stat": "Sum", "label": f"(in) hits {short(node)}", "visible": False}])
         h.append(f"h{i}")
     for i, node in enumerate(nodes):
         metrics.append(["AWS/ElastiCache", "CacheMisses", "CacheClusterId", node,
-                        {"id": f"mm{i}", "stat": "Sum", "visible": False}])
+                        {"id": f"mm{i}", "stat": "Sum", "label": f"(in) miss {short(node)}", "visible": False}])
         m.append(f"mm{i}")
-    # optional per-node hit-rate lines
-    if show_nodes:
-        for i in range(len(nodes)):
-            metrics.append([{"expression": f"100*h{i}/(h{i}+mm{i}+1)",
-                             "label": short(nodes[i]), "id": f"hr{i}"}])
+    for i in range(len(nodes)):
+        metrics.append([{"expression": f"100*h{i}/(h{i}+mm{i}+1)",
+                         "label": short(nodes[i]), "id": f"hr{i}", "visible": False}])
     hs, ms = f"SUM([{','.join(h)}])", f"SUM([{','.join(m)}])"
     metrics.append([{"expression": f"100*{hs}/({hs}+{ms}+1)",
                      "label": "All nodes (AVG)", "id": "hragg", "color": color}])
     return {
         "type": "metric",
         "properties": {
-            "title": title, "region": region, "view": "timeSeries", "period": 60,
+            "title": title, "region": region, "view": "timeSeries",
+            "period": 60, "legend": {"position": "right"},
             "yAxis": {"left": {"label": "Percent", "showUnits": False, "min": 0, "max": 100}},
             "metrics": metrics,
         },
@@ -170,15 +160,9 @@ def place_row(left_w, right_w, y):
     return [left_w, right_w]
 
 
-def build_dashboard(region, old, new, old_color, new_color, show_nodes):
+def build_dashboard(region, old, new, old_color, new_color):
     (old_nodes, old_type, old_ver) = old
     (new_nodes, new_type, new_ver) = new
-
-    node_tip = ("Each chart shows every node plus a bold **All nodes** aggregate (the sum/average, "
-                "in the column color). **Click any node name in a chart's legend to isolate or hide "
-                "it** -- that's how you drill into individual nodes vs the aggregate."
-                if show_nodes else
-                "Charts show the **All nodes** aggregate only (run with `--nodes show` to add per-node lines).")
 
     header_md = (
         f"# Redis / Valkey Deployment Comparison  -  side by side\n"
@@ -187,7 +171,10 @@ def build_dashboard(region, old, new, old_color, new_color, show_nodes):
         f"| Engine / version | {old_ver} | {new_ver} |\n"
         f"| Node type | {old_type} | {new_type} |\n"
         f"| Nodes | {len(old_nodes)} | {len(new_nodes)} |\n\n"
-        f"{node_tip}\n\n"
+        f"**Default view:** only the bold **All nodes** aggregate is drawn (column color). "
+        f"Every node also sits in the legend, **deselected (greyed)** -- click a node name to add its "
+        f"line (one, several, or all; click again to hide). It's a live toggle and doesn't change the "
+        f"saved dashboard.\n\n"
         f"**Statistics (AWS convention):** gauges (CPU %, memory %, connections, latency, lag) use "
         f"**Average** per node; counters (evictions, hits/misses, new connections, allowance-exceeded) "
         f"use **Sum**. **Headline check:** *Net Bandwidth OUT Allowance Exceeded* should read ~0 on NEW."
@@ -198,13 +185,13 @@ def build_dashboard(region, old, new, old_color, new_color, show_nodes):
     y = 6
     for (m, t, stat, agg, yl) in METRICS:
         y_max = 100 if yl == "Percent" else None
-        lw = cluster_widget(f"{t}  |  OLD", m, stat, agg, yl, region, old_nodes, old_color, show_nodes, y_max)
-        rw = cluster_widget(f"{t}  |  NEW", m, stat, agg, yl, region, new_nodes, new_color, show_nodes, y_max)
+        lw = cluster_widget(f"{t}  |  OLD", m, stat, agg, yl, region, old_nodes, old_color, y_max)
+        rw = cluster_widget(f"{t}  |  NEW", m, stat, agg, yl, region, new_nodes, new_color, y_max)
         widgets += place_row(lw, rw, y)
         y += 6
 
-    lw = cluster_hitrate_widget("Cache Hit Rate %  |  OLD", region, old_nodes, old_color, show_nodes)
-    rw = cluster_hitrate_widget("Cache Hit Rate %  |  NEW", region, new_nodes, new_color, show_nodes)
+    lw = cluster_hitrate_widget("Cache Hit Rate %  |  OLD", region, old_nodes, old_color)
+    rw = cluster_hitrate_widget("Cache Hit Rate %  |  NEW", region, new_nodes, new_color)
     widgets += place_row(lw, rw, y)
 
     return {"widgets": widgets}
@@ -224,26 +211,22 @@ def put_dashboard(name, body, region):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Side-by-side ElastiCache comparison dashboard with per-node lines + aggregate.")
+    ap = argparse.ArgumentParser(description="Side-by-side ElastiCache comparison dashboard; aggregate drawn, nodes deselected in legend.")
     ap.add_argument("--old-rg", required=True, help="OLD replication group id (left column)")
     ap.add_argument("--new-rg", required=True, help="NEW replication group id (right column)")
     ap.add_argument("--region", default="us-east-1")
     ap.add_argument("--name", default="redis-valkey-old-vs-new")
     ap.add_argument("--old-color", default="#1f77b4", help="Aggregate-line color for LEFT/OLD (default blue)")
     ap.add_argument("--new-color", default="#ff7f0e", help="Aggregate-line color for RIGHT/NEW (default orange)")
-    ap.add_argument("--nodes", choices=["show", "hide"], default="show",
-                    help="show (default) = per-node lines + aggregate; hide = aggregate only")
     args = ap.parse_args()
-    show_nodes = args.nodes == "show"
 
     print(f"Discovering nodes in {args.region} ...")
     old = describe_cluster(args.old_rg, args.region)
     new = describe_cluster(args.new_rg, args.region)
     print(f"  OLD {args.old_rg}: {len(old[0])} node(s), {old[1]}, {old[2]}  -> color {args.old_color}")
     print(f"  NEW {args.new_rg}: {len(new[0])} node(s), {new[1]}, {new[2]}  -> color {args.new_color}")
-    print(f"  per-node lines: {'ON' if show_nodes else 'OFF'}")
 
-    body = build_dashboard(args.region, old, new, args.old_color, args.new_color, show_nodes)
+    body = build_dashboard(args.region, old, new, args.old_color, args.new_color)
     path = put_dashboard(args.name, body, args.region)
 
     url = (f"https://{args.region}.console.aws.amazon.com/cloudwatch/home"
