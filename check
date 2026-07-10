@@ -1,55 +1,36 @@
-Since you're `exec`-ing into a broker pod, the CLI tools are on the pod, so the bootstrap server is local. All of these are **read-only** (consuming doesn't remove messages).
+Different situation — on the EKS node you're outside the pod, so `localhost:9092` won't reach Kafka and the CLI tools aren't on the node. You've got two clean options.
 
-The core one — read messages and grep for your search string:
-
-```bash
-kafka-console-consumer.sh --bootstrap-server localhost:9092 \
-  --topic <topic> --from-beginning \
-  --property print.key=true --property print.timestamp=true \
-  --timeout-ms 15000 | grep '<search-string>'
-```
-
-`--from-beginning` reads the whole topic; `--timeout-ms` makes the consumer exit after that many ms of no new messages (otherwise it hangs waiting forever). Drop `--from-beginning` to only see new/live messages.
-
-A few variations depending on what you need:
-
-**Search only recent messages** (last N per partition — much faster on a big topic):
+**Option 1 (recommended): run the command inside the pod without a shell session.** You said you'd use `kubectl exec -it` — you don't need the interactive shell, just run the consumer directly through exec from the node:
 
 ```bash
-kafka-console-consumer.sh --bootstrap-server localhost:9092 \
-  --topic <topic> --offset -<N> --partition 0 \
-  --timeout-ms 10000 | grep '<search-string>'
-```
-
-`--offset` needs a specific `--partition`; repeat per partition, or use `--max-messages` instead to cap total across all partitions.
-
-**Case-insensitive, with context, show partition/offset** (helps you locate the message):
-
-```bash
-kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+kubectl exec $KAFKA_POD -n kafka -- \
+  kafka-console-consumer.sh --bootstrap-server localhost:9092 \
   --topic <topic> --from-beginning --timeout-ms 15000 \
   --property print.partition=true --property print.offset=true \
   --property print.key=true --property print.timestamp=true \
   | grep -i '<search-string>'
 ```
 
-**Search within a time window** — first resolve the offset for a start time, then consume from it:
+Note: **drop the `-it` flags** when piping to `grep` — `-t` allocates a TTY and mangles the output for piping. Plain `kubectl exec` (no `-i`/`-t`) is correct here. The `grep` runs on the node, which is fine; only the consumer needs to run in the pod.
+
+**Option 2: spin up a throwaway Kafka client pod** (if you'd rather not touch the broker pod, or it doesn't have the tools):
 
 ```bash
-# offset at/after a timestamp (epoch millis) for partition 0
-kafka-run-class.sh kafka.tools.GetOffsetShell \
-  --bootstrap-server localhost:9092 --topic <topic> --time <epoch-ms>
-# then consume from that offset:
-kafka-console-consumer.sh --bootstrap-server localhost:9092 \
-  --topic <topic> --partition 0 --offset <offset-from-above> \
-  --timeout-ms 10000 | grep '<search-string>'
+kubectl run kafka-client --rm -i --image=bitnami/kafka:latest -n kafka --restart=Never -- \
+  kafka-console-consumer.sh \
+  --bootstrap-server <bootstrap-service>:9092 \
+  --topic <topic> --from-beginning --timeout-ms 15000 | grep -i '<search-string>'
 ```
 
-A few practical notes:
+Here you need the **in-cluster bootstrap address** (a Service DNS name like `kafka.kafka.svc.cluster.local:9092` or your MSK bootstrap brokers), not `localhost`, since this pod isn't the broker. `--rm` deletes it on exit.
 
-- **If the topic is large, always bound the search** with `--max-messages`, `--offset -<N>`, or a time window — a full `--from-beginning` scan on a high-volume topic can read millions of records and take a long time.
-- **Consumer group offsets aren't touched** by console-consumer (it uses a throwaway group), so this won't interfere with your real consumers.
-- **If auth/TLS is enabled** on the cluster (common for MSK), add `--consumer.config /path/to/client.properties` with the security settings, or the consumer will fail to connect. Check whether your other consumers use such a file.
-- **For counting matches** instead of printing, pipe to `grep -c '<search-string>'`.
+To find the bootstrap service if you don't know it:
 
-If you tell me the topic name, roughly how big it is, and whether it's JSON/Avro/plaintext, I'll give you the exact single command — and if it's Avro, note that you'll need `kafka-avro-console-consumer` with a schema-registry URL instead, since plain `grep` won't read Avro-encoded bytes.
+```bash
+kubectl get svc -n kafka
+kubectl get $KAFKA_POD -n kafka -o jsonpath='{.spec.containers[0].command}'   # sometimes shows the listener
+```
+
+Everything is still read-only (consuming with a throwaway group removes nothing and doesn't touch your real consumer offsets). The same bounding advice applies — add `--max-messages <n>` or `--offset -<N> --partition <p>` so a large topic doesn't stream millions of records.
+
+Option 1 is almost always the move since the broker pod already has the tools and `localhost:9092` works *inside* it. Want me to fold this into a small one-liner script that takes the topic and search string as arguments?
