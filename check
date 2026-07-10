@@ -1,257 +1,55 @@
-#!/usr/bin/env python3
-"""
-build_redis_compare_dashboard.py
+Since you're `exec`-ing into a broker pod, the CLI tools are on the pod, so the bootstrap server is local. All of these are **read-only** (consuming doesn't remove messages).
 
-Side-by-side CloudWatch dashboard comparing two ElastiCache (Valkey/Redis)
-replication groups:
+The core one — read messages and grep for your search string:
 
-    LEFT column  = OLD cluster  (its own color)
-    RIGHT column = NEW cluster  (its own color)
+```bash
+kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic <topic> --from-beginning \
+  --property print.key=true --property print.timestamp=true \
+  --timeout-ms 15000 | grep '<search-string>'
+```
 
-Each metric = one row of two charts (OLD | NEW).
+`--from-beginning` reads the whole topic; `--timeout-ms` makes the consumer exit after that many ms of no new messages (otherwise it hangs waiting forever). Drop `--from-beginning` to only see new/live messages.
 
-Default view per chart:
-  * ONLY the bold "All nodes" aggregate line is drawn (in the column color).
-  * Every individual node also appears in the legend, but DESELECTED (greyed).
-    Click a node's name in the legend to draw its line -- click one, several,
-    or all of them; click again to hide. (This is CloudWatch's native legend
-    toggle; it's a live view change and does not alter the saved dashboard.)
+A few variations depending on what you need:
 
-Statistics follow AWS guidance:
-  * Gauges (level at a point in time)      -> Average per node
-      CPU %, EngineCPU %, memory %, FreeableMemory, CurrConnections,
-      read/write latency, ReplicationLag
-  * Counters (events over the period)      -> Sum per node
-      Evictions, CacheHits, CacheMisses, NewConnections, all ...AllowanceExceeded
-Cross-node aggregation is meaningful per metric: SUM (totals),
-MAX (worst node), MIN (worst-case free memory).
+**Search only recent messages** (last N per partition — much faster on a big topic):
 
-Safety: everything read is read-only. The ONLY write is creating/replacing the
-named dashboard. Uses the AWS CLI (no boto3). Needs CloudWatch + ElastiCache
-read + PutDashboard.
+```bash
+kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic <topic> --offset -<N> --partition 0 \
+  --timeout-ms 10000 | grep '<search-string>'
+```
 
-Usage:
-  ./build_redis_compare_dashboard.py \
-      --old-rg <old-rg-id> --new-rg <new-rg-id> --region <region> \
-      [--name <dashboard-name>] \
-      [--old-color '#1f77b4'] [--new-color '#ff7f0e']
-"""
-import argparse
-import json
-import subprocess
-import sys
-import tempfile
+`--offset` needs a specific `--partition`; repeat per partition, or use `--max-messages` instead to cap total across all partitions.
 
-# metric_name, title, PER-NODE STAT (AWS), CROSS-NODE AGG, y-axis label
-METRICS = [
-    ("NetworkBandwidthOutAllowanceExceeded",     "Net Bandwidth OUT Allowance Exceeded  (KEY)", "Sum",     "SUM", "Count (shaped)"),
-    ("NetworkBytesOut",                          "Network Bytes Out",                           "Sum",     "SUM", "Bytes"),
-    ("NetworkBandwidthInAllowanceExceeded",      "Net Bandwidth IN Allowance Exceeded",         "Sum",     "SUM", "Count (shaped)"),
-    ("NetworkBytesIn",                           "Network Bytes In",                            "Sum",     "SUM", "Bytes"),
-    ("NetworkPacketsPerSecondAllowanceExceeded", "PPS Allowance Exceeded",                      "Sum",     "SUM", "Count"),
-    ("NetworkConntrackAllowanceExceeded",        "Conntrack Allowance Exceeded",                "Sum",     "SUM", "Count"),
-    ("EngineCPUUtilization",                     "Engine CPU %  (worst node - single-thread)",  "Average", "MAX", "Percent"),
-    ("CPUUtilization",                           "Host CPU %  (worst node)",                    "Average", "MAX", "Percent"),
-    ("DatabaseMemoryUsagePercentage",            "Memory Used %  (worst node)",                 "Average", "MAX", "Percent"),
-    ("FreeableMemory",                           "Freeable Memory  (min node)",                 "Average", "MIN", "Bytes"),
-    ("Evictions",                                "Evictions",                                   "Sum",     "SUM", "Count"),
-    ("CurrConnections",                          "Current Connections",                         "Average", "SUM", "Count"),
-    ("NewConnections",                           "New Connections",                             "Sum",     "SUM", "Count"),
-    ("SuccessfulReadRequestLatency",             "Read Latency  (worst node)",                  "Average", "MAX", "Microseconds"),
-    ("SuccessfulWriteRequestLatency",            "Write Latency  (worst node)",                 "Average", "MAX", "Microseconds"),
-    ("ReplicationLag",                           "Replication Lag  (worst node)",               "Average", "MAX", "Seconds"),
-]
+**Case-insensitive, with context, show partition/offset** (helps you locate the message):
 
-# Colors assigned EXPLICITLY to individual node lines so CloudWatch's auto-palette
-# can't reuse an aggregate color. The two aggregate colors are filtered out of this
-# list at build time (see build_dashboard), guaranteeing no collision.
-NODE_PALETTE = [
-    "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
-    "#bcbd22", "#17becf", "#aec7e8", "#ffbb78", "#c5b0d5",
-]
+```bash
+kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic <topic> --from-beginning --timeout-ms 15000 \
+  --property print.partition=true --property print.offset=true \
+  --property print.key=true --property print.timestamp=true \
+  | grep -i '<search-string>'
+```
 
+**Search within a time window** — first resolve the offset for a start time, then consume from it:
 
-def aws_json(args):
-    proc = subprocess.run(["aws", *args, "--output", "json"],
-                          capture_output=True, text=True)
-    if proc.returncode != 0:
-        sys.exit(f"ERROR: `aws {' '.join(args)}` failed:\n{proc.stderr.strip()}")
-    return json.loads(proc.stdout or "{}")
+```bash
+# offset at/after a timestamp (epoch millis) for partition 0
+kafka-run-class.sh kafka.tools.GetOffsetShell \
+  --bootstrap-server localhost:9092 --topic <topic> --time <epoch-ms>
+# then consume from that offset:
+kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic <topic> --partition 0 --offset <offset-from-above> \
+  --timeout-ms 10000 | grep '<search-string>'
+```
 
+A few practical notes:
 
-def describe_cluster(rg_id, region):
-    """Return (member_node_ids, node_type, engine_version)."""
-    data = aws_json(["elasticache", "describe-replication-groups",
-                     "--replication-group-id", rg_id, "--region", region])
-    groups = data.get("ReplicationGroups", [])
-    if not groups:
-        sys.exit(f"ERROR: replication group not found: {rg_id}")
-    g = groups[0]
-    nodes = g.get("MemberClusters", [])
-    if not nodes:
-        sys.exit(f"ERROR: no member nodes found for {rg_id}")
-    node_type = g.get("CacheNodeType", "n/a")
-    version = "n/a"
-    try:
-        cc = aws_json(["elasticache", "describe-cache-clusters",
-                       "--cache-cluster-id", nodes[0], "--region", region])
-        clusters = cc.get("CacheClusters", [])
-        if clusters:
-            engine = clusters[0].get("Engine", "")
-            version = f"{engine} {clusters[0].get('EngineVersion', '')}".strip()
-    except SystemExit:
-        pass
-    return nodes, node_type, version
+- **If the topic is large, always bound the search** with `--max-messages`, `--offset -<N>`, or a time window — a full `--from-beginning` scan on a high-volume topic can read millions of records and take a long time.
+- **Consumer group offsets aren't touched** by console-consumer (it uses a throwaway group), so this won't interfere with your real consumers.
+- **If auth/TLS is enabled** on the cluster (common for MSK), add `--consumer.config /path/to/client.properties` with the security settings, or the consumer will fail to connect. Check whether your other consumers use such a file.
+- **For counting matches** instead of printing, pipe to `grep -c '<search-string>'`.
 
-
-def short(node_id):
-    return node_id.split("-", 1)[-1] if "-" in node_id else node_id
-
-
-def cluster_widget(title, metric_name, stat, agg, ylabel, region, nodes, color, node_colors, y_max=None):
-    """One chart for ONE cluster.
-    Node metrics are visible:false -> present in the legend (deselected/greyed),
-    click to draw. The aggregate expression is the only line drawn by default.
-    Each node gets an EXPLICIT color from node_colors so a revealed node line can
-    never collide with the aggregate color."""
-    metrics, ids = [], []
-    for i, node in enumerate(nodes):
-        mid = f"m{i}"
-        ids.append(mid)
-        metrics.append(["AWS/ElastiCache", metric_name, "CacheClusterId", node,
-                        {"id": mid, "stat": stat, "label": short(node),
-                         "color": node_colors[i % len(node_colors)], "visible": False}])
-    metrics.append([{"expression": f"{agg}([{','.join(ids)}])",
-                     "label": f"All nodes ({agg})", "id": "agg", "color": color}])
-    left_axis = {"label": ylabel, "showUnits": False, "min": 0}
-    if y_max is not None:
-        left_axis["max"] = y_max
-    return {
-        "type": "metric",
-        "properties": {
-            "title": title, "region": region, "view": "timeSeries", "stacked": False,
-            "period": 60, "legend": {"position": "right"},
-            "yAxis": {"left": left_axis}, "metrics": metrics,
-        },
-    }
-
-
-def cluster_hitrate_widget(title, region, nodes, color, node_colors):
-    """Hit rate %: aggregate drawn by default; per-node rate lines in the legend
-    (deselected, click to draw). Raw hits/misses are hidden inputs."""
-    metrics, h, m = [], [], []
-    for i, node in enumerate(nodes):
-        metrics.append(["AWS/ElastiCache", "CacheHits", "CacheClusterId", node,
-                        {"id": f"h{i}", "stat": "Sum", "label": f"(in) hits {short(node)}", "visible": False}])
-        h.append(f"h{i}")
-    for i, node in enumerate(nodes):
-        metrics.append(["AWS/ElastiCache", "CacheMisses", "CacheClusterId", node,
-                        {"id": f"mm{i}", "stat": "Sum", "label": f"(in) miss {short(node)}", "visible": False}])
-        m.append(f"mm{i}")
-    for i in range(len(nodes)):
-        metrics.append([{"expression": f"100*h{i}/(h{i}+mm{i}+1)",
-                         "label": short(nodes[i]), "id": f"hr{i}",
-                         "color": node_colors[i % len(node_colors)], "visible": False}])
-    hs, ms = f"SUM([{','.join(h)}])", f"SUM([{','.join(m)}])"
-    metrics.append([{"expression": f"100*{hs}/({hs}+{ms}+1)",
-                     "label": "All nodes (AVG)", "id": "hragg", "color": color}])
-    return {
-        "type": "metric",
-        "properties": {
-            "title": title, "region": region, "view": "timeSeries",
-            "period": 60, "legend": {"position": "right"},
-            "yAxis": {"left": {"label": "Percent", "showUnits": False, "min": 0, "max": 100}},
-            "metrics": metrics,
-        },
-    }
-
-
-def place_row(left_w, right_w, y):
-    left_w.update({"x": 0, "y": y, "width": 12, "height": 6})
-    right_w.update({"x": 12, "y": y, "width": 12, "height": 6})
-    return [left_w, right_w]
-
-
-def build_dashboard(region, old, new, old_color, new_color):
-    (old_nodes, old_type, old_ver) = old
-    (new_nodes, new_type, new_ver) = new
-
-    # node-line colors = palette minus the two aggregate colors, so a revealed
-    # node line can never match the aggregate (blue/green) lines
-    reserved = {old_color.lower(), new_color.lower()}
-    node_colors = [c for c in NODE_PALETTE if c.lower() not in reserved] or NODE_PALETTE
-
-    header_md = (
-        f"# Redis / Valkey Deployment Comparison  -  side by side\n"
-        f"**LEFT = OLD**  ·  **RIGHT = NEW**  ·  one metric per row, two charts\n\n"
-        f"| | OLD (left) | NEW (right) |\n|---|---|---|\n"
-        f"| Engine / version | {old_ver} | {new_ver} |\n"
-        f"| Node type | {old_type} | {new_type} |\n"
-        f"| Nodes | {len(old_nodes)} | {len(new_nodes)} |\n\n"
-        f"**Default view:** only the bold **All nodes** aggregate is drawn (column color). "
-        f"Every node also sits in the legend, **deselected (greyed)** -- click a node name to add its "
-        f"line (one, several, or all; click again to hide). It's a live toggle and doesn't change the "
-        f"saved dashboard.\n\n"
-        f"**Statistics (AWS convention):** gauges (CPU %, memory %, connections, latency, lag) use "
-        f"**Average** per node; counters (evictions, hits/misses, new connections, allowance-exceeded) "
-        f"use **Sum**. **Headline check:** *Net Bandwidth OUT Allowance Exceeded* should read ~0 on NEW."
-    )
-    widgets = [{"type": "text", "x": 0, "y": 0, "width": 24, "height": 6,
-                "properties": {"markdown": header_md}}]
-
-    y = 6
-    for (m, t, stat, agg, yl) in METRICS:
-        y_max = 100 if yl == "Percent" else None
-        lw = cluster_widget(f"{t}  |  OLD", m, stat, agg, yl, region, old_nodes, old_color, node_colors, y_max)
-        rw = cluster_widget(f"{t}  |  NEW", m, stat, agg, yl, region, new_nodes, new_color, node_colors, y_max)
-        widgets += place_row(lw, rw, y)
-        y += 6
-
-    lw = cluster_hitrate_widget("Cache Hit Rate %  |  OLD", region, old_nodes, old_color, node_colors)
-    rw = cluster_hitrate_widget("Cache Hit Rate %  |  NEW", region, new_nodes, new_color, node_colors)
-    widgets += place_row(lw, rw, y)
-
-    return {"widgets": widgets}
-
-
-def put_dashboard(name, body, region):
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-        json.dump(body, f)
-        path = f.name
-    out = aws_json(["cloudwatch", "put-dashboard",
-                    "--dashboard-name", name,
-                    "--dashboard-body", f"file://{path}",
-                    "--region", region])
-    for msg in out.get("DashboardValidationMessages", []):
-        print(f"  validation: {msg}")
-    return path
-
-
-def main():
-    ap = argparse.ArgumentParser(description="Side-by-side ElastiCache comparison dashboard; aggregate drawn, nodes deselected in legend.")
-    ap.add_argument("--old-rg", required=True, help="OLD replication group id (left column)")
-    ap.add_argument("--new-rg", required=True, help="NEW replication group id (right column)")
-    ap.add_argument("--region", default="us-east-1")
-    ap.add_argument("--name", default="redis-valkey-old-vs-new")
-    ap.add_argument("--old-color", default="#1f77b4", help="Aggregate-line color for LEFT/OLD (default blue)")
-    ap.add_argument("--new-color", default="#ff7f0e", help="Aggregate-line color for RIGHT/NEW (default orange)")
-    args = ap.parse_args()
-
-    print(f"Discovering nodes in {args.region} ...")
-    old = describe_cluster(args.old_rg, args.region)
-    new = describe_cluster(args.new_rg, args.region)
-    print(f"  OLD {args.old_rg}: {len(old[0])} node(s), {old[1]}, {old[2]}  -> color {args.old_color}")
-    print(f"  NEW {args.new_rg}: {len(new[0])} node(s), {new[1]}, {new[2]}  -> color {args.new_color}")
-
-    body = build_dashboard(args.region, old, new, args.old_color, args.new_color)
-    path = put_dashboard(args.name, body, args.region)
-
-    url = (f"https://{args.region}.console.aws.amazon.com/cloudwatch/home"
-           f"?region={args.region}#dashboards/dashboard/{args.name}")
-    print(f"\nDashboard '{args.name}' created/updated.")
-    print(f"Open it: {url}")
-    print(f"(JSON written to {path} for version control)")
-
-
-if __name__ == "__main__":
-    main()
+If you tell me the topic name, roughly how big it is, and whether it's JSON/Avro/plaintext, I'll give you the exact single command — and if it's Avro, note that you'll need `kafka-avro-console-consumer` with a schema-registry URL instead, since plain `grep` won't read Avro-encoded bytes.
