@@ -1,0 +1,106 @@
+Yes—that means the dependency coordinate is valid. The problem is dependency traffic, not sts.
+
+An AWS BOM only controls versions; it does not contain the STS library. Gradle must still download the STS POM/JAR and its transitive dependencies separately. 
+
+Recommended GitHub Actions configuration
+
+- uses: actions/checkout@v6
+
+- uses: actions/setup-java@v5
+  with:
+    distribution: temurin
+    java-version: '17'
+    # Do not also configure cache: gradle here
+
+- name: Set up Gradle cache
+  uses: gradle/actions/setup-gradle@v6
+  with:
+    cache-provider: basic
+
+- name: Build
+  run: ./gradlew build --no-daemon
+
+setup-gradle restores downloaded dependencies from GitHub’s cache, so later builds should not repeatedly request STS from Maven Central. Do not combine its caching with actions/setup-java’s Gradle cache or a separate actions/cache configuration. 
+
+Also remove any of these:
+
+./gradlew build --refresh-dependencies
+rm -rf ~/.gradle/caches
+./gradlew dependencies
+
+--refresh-dependencies and deleting the cache force additional repository requests.
+
+Check dependency-submission workflows
+
+Look for this action:
+
+uses: gradle/actions/dependency-submission@...
+
+By default, it runs a special task that resolves all project dependencies, potentially causing another complete set of Maven Central requests. 
+
+Run dependency submission only on main or on a schedule—not in every PR or matrix job:
+
+on:
+  push:
+    branches: [main]
+
+Alternatively, capture the dependency graph during the normal build rather than resolving everything in a separate job:
+
+- uses: gradle/actions/setup-gradle@v6
+  with:
+    cache-provider: basic
+    dependency-graph: generate-and-submit
+
+- run: ./gradlew build
+
+This reports dependencies resolved by the actual build. 
+
+Reduce parallel cold builds
+
+Multiple matrix jobs can hit Maven Central simultaneously before any job has saved its cache:
+
+strategy:
+  max-parallel: 1
+  matrix:
+    java: ['17', '21']
+
+Serializing is a useful immediate mitigation, though it is not as robust as a repository proxy.
+
+Best long-term solution: repository proxy
+
+For reliable CI, place Nexus, Artifactory, AWS CodeArtifact, or another caching repository manager between Gradle and Maven Central. Configure that proxy as the only repository:
+
+// settings.gradle
+dependencyResolutionManagement {
+    repositories {
+        maven {
+            url = uri(System.getenv("MAVEN_PROXY_URL"))
+
+            credentials {
+                username = System.getenv("MAVEN_PROXY_USERNAME")
+                password = System.getenv("MAVEN_PROXY_PASSWORD")
+            }
+        }
+    }
+}
+
+Do not add mavenCentral() after the proxy when the proxy already mirrors Central; otherwise Gradle may fall through and contact Central directly.
+
+Sonatype’s official guidance for HTTP 429 is to reduce repeated downloads through caching and repository managers, consolidate requests, and avoid aggressive retries. The limit can be based on aggregate traffic from a shared network or CI-provider egress—not necessarily only your repository. 
+
+Dependency declaration
+
+When STS is your only AWS SDK module, this minimizes one BOM request:
+
+dependencies {
+    implementation 'software.amazon.awssdk:sts:2.23.12'
+}
+
+When using several AWS SDK modules, keep the BOM for version consistency:
+
+dependencies {
+    implementation platform('software.amazon.awssdk:bom:2.23.12')
+    implementation 'software.amazon.awssdk:sts'
+}
+
+Neither form can prevent Gradle from downloading STS separately; caching or proxying is the actual fix.
